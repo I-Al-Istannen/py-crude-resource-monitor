@@ -8,18 +8,18 @@ license = "MIT"
 unwind = ["py-spy/unwind"]
 
 [dependencies]
-anyhow = "1.0.93"
-clap = "4.5.21"
-env_logger = "0.11.5"
+anyhow = "1.0.95"
+clap = "4.5.23"
+env_logger = "0.11.6"
 log = "0.4.22"
 py-spy = { version = "0.4.0" }
-serde_json = "1.0.133"
-sysinfo = "0.32.1"
-serde = { version = "1.0.215", features = ["derive"] }
+serde_json = "1.0.134"
+sysinfo = "0.33.1"
+serde = { version = "1.0.217", features = ["derive"] }
 dialoguer = "0.11.0"
-tokio = { version = "1.41.1", features = ["full"] }
+tokio = { version = "1.42.0", features = ["full"] }
 axum = { version = "0.7.9", features = ["macros"] }
 rust-embed = "8.5.0"
 mime_guess = "2.0.5"
 tower-http = { version = "0.6.2", features = ["cors", "fs"] }
-tower = { version = "0.5.1", features = ["util"] }
+tower = { version = "0.5.2", features = ["util"] }
