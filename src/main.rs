@@ -34,8 +34,13 @@ enum Subcommands {
     /// Profile
     Profile {
         /// The PID of the Python process to monitor
-        pid: u32,
+        #[arg(short, long)]
+        pid: Option<u32>,
+        /// The command to execute
+        #[clap(conflicts_with = "pid")]
+        command: Option<Vec<String>>,
         /// output directory
+        #[arg(short, long)]
         output_dir: PathBuf,
         /// ms between samples
         #[arg(short, long)]
@@ -74,7 +79,8 @@ fn main() -> anyhow::Result<()> {
             output_dir,
             sample_rate,
             native,
-        } => run_profile(pid, output_dir, sample_rate, native),
+            command,
+        } => run_profile(pid, command, output_dir, sample_rate, native),
         Subcommands::View {
             output_dir,
             interface,
@@ -84,7 +90,8 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_profile(
-    pid: u32,
+    pid: Option<u32>,
+    command: Option<Vec<String>>,
     output_dir: PathBuf,
     sample_rate: Option<u64>,
     native: bool,
@@ -97,6 +104,21 @@ fn run_profile(
 
     std::fs::create_dir_all(&output_dir)?;
     clear_data_dir(&output_dir)?;
+
+    let pid: u32 = if let Some(pid) = pid {
+        pid
+    } else {
+        // command cannot be None here, this was checked by clap
+        let command = command.unwrap();
+        info!("Starting process with command: {}", command.join(" "));
+        let child = std::process::Command::new(&command[0])
+            .args(&command[1..])
+            .stderr(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .spawn()?;
+        child.id()
+    };
+    info!("Monitoring process with PID {}", pid);
 
     let mut tracker = Tracker::new(pid, output_dir.clone(), native)?;
     while tracker.is_still_tracking() {
