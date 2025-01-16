@@ -21,15 +21,15 @@ impl SystemMeasurements {
 
     pub fn refresh(&mut self) {
         self.system.refresh_specifics(
-            RefreshKind::new()
-                .with_cpu(CpuRefreshKind::new().with_cpu_usage())
+            RefreshKind::default()
+                .with_cpu(CpuRefreshKind::default().with_cpu_usage())
                 .with_processes(
-                    ProcessRefreshKind::new()
+                    ProcessRefreshKind::default()
                         .with_cpu()
                         .with_memory()
                         .with_cmd(UpdateKind::Always),
                 )
-                .with_memory(MemoryRefreshKind::new().with_ram()),
+                .with_memory(MemoryRefreshKind::default().with_ram()),
         );
     }
 
