@@ -10,7 +10,7 @@ use clap::builder::Styles;
 use clap::{Parser, Subcommand};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::Confirm;
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -105,8 +105,8 @@ fn run_profile(
     std::fs::create_dir_all(&output_dir)?;
     clear_data_dir(&output_dir)?;
 
-    let pid: u32 = if let Some(pid) = pid {
-        pid
+    let (pid, child) = if let Some(pid) = pid {
+        (pid, None)
     } else {
         // command cannot be None here, this was checked by clap
         let command = command.unwrap();
@@ -116,23 +116,32 @@ fn run_profile(
             .stderr(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .spawn()?;
-        child.id()
+        (child.id(), Some(child))
     };
     info!("Monitoring process with PID {}", pid);
 
-    let mut tracker = Tracker::new(pid, output_dir.clone(), native)?;
-    while tracker.is_still_tracking() {
-        tracker.tick();
-        thread::sleep(sample_sleep_duration);
+    let tracker = Tracker::new(pid, output_dir.clone(), native);
+    match tracker {
+        Ok(mut tracker) => {
+            while tracker.is_still_tracking() {
+                tracker.tick();
+                thread::sleep(sample_sleep_duration);
+            }
+            info!("All processes have exited, exiting");
+            info!(
+                "View the profile data by running `{} view {:?}`",
+                std::env::current_exe()?.to_string_lossy(),
+                output_dir.to_string_lossy()
+            );
+        }
+        Err(e) => {
+            if let Some(mut child) = child {
+                warn!("Failed to start tracker. Killing process with PID {}.", pid);
+                child.kill()?;
+            }
+            return Err(e);
+        }
     }
-
-    info!("All processes have exited, exiting");
-    info!(
-        "View the profile data by running `{} view {:?}`",
-        std::env::current_exe()?.to_string_lossy(),
-        output_dir.to_string_lossy()
-    );
-
     Ok(())
 }
 
