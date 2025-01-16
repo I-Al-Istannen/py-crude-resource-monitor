@@ -31,7 +31,7 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Subcommands {
-    /// Profile
+    /// Profile a Python process
     Profile {
         /// The PID of the Python process to monitor
         #[arg(short, long)]
@@ -54,6 +54,7 @@ enum Subcommands {
         #[arg(long)]
         native: bool,
     },
+    /// Host a web server to view the profile data
     View {
         /// output directory
         output_dir: PathBuf,

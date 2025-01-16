@@ -15,21 +15,38 @@ Existing profilers, like `py-spy`, do not capture memory usage.
 Existing memory profilers, like `memray`, attribute 90% of it to `unknown` in
 my workload, which was not extremely helpful.
 
-### Screenshots
-<img align="middle" src="https://github.com/I-Al-Istannen/py-crude-resource-monitor/blob/master/media/example_01.jpg?raw=true">
+## Installation
 
-<img align="middle" src="https://github.com/I-Al-Istannen/py-crude-resource-monitor/blob/master/media/example_02.jpg?raw=true">
+You can install the tool using `cargo`:
 
-### Usage
-
+```bash
+cargo install --locked --git https://github.com/I-Al-Istannen/py-crude-resource-monitor.git
 ```
+
+Or using `pixi`:
+
+```bash
+pixi global install py-crude-resource-monitor
+```
+
+## Screenshots
+
+![example](./media/example_01.jpg)
+![example](./media/example_02.jpg)
+
+## Usage
+
+> [!NOTE]
+> On some systems, you might need to run the tool as root to be able to capture the process stack traces.
+
+```text
 A small utility to monitor resource usage of Python processes
 
 Usage: py-crude-resource-monitor <COMMAND>
 
 Commands:
-  profile  Profile
-  view
+  profile  Profile a Python process
+  view     Host a web server to view the profile data
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -37,20 +54,25 @@ Options:
   -V, --version  Print version
 ```
 
-```
-Usage: py-crude-resource-monitor profile [OPTIONS] <PID> <OUTPUT_DIR>
+```text
+Profile a Python process
+
+Usage: py-crude-resource-monitor profile [OPTIONS] --output-dir <OUTPUT_DIR> [COMMAND]...
 
 Arguments:
-  <PID>         The PID of the Python process to monitor
-  <OUTPUT_DIR>  output directory
+  [COMMAND]...  The command to execute
 
 Options:
+  -p, --pid <PID>                  The PID of the Python process to monitor
+  -o, --output-dir <OUTPUT_DIR>    output directory
   -s, --sample-rate <SAMPLE_RATE>  ms between samples
       --native                     capture native stack traces
   -h, --help                       Print help
 ```
 
-```
+```text
+Host a web server to view the profile data
+
 Usage: py-crude-resource-monitor view [OPTIONS] <OUTPUT_DIR>
 
 Arguments:
