@@ -7,7 +7,7 @@ use crate::tracker::Tracker;
 use anyhow::bail;
 use clap::builder::styling::AnsiColor;
 use clap::builder::Styles;
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::Confirm;
 use log::{debug, info, warn};
@@ -32,6 +32,7 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Subcommands {
     /// Profile a Python process
+    #[clap(group(ArgGroup::new("target").required(true).args(&["pid", "command"])))]
     Profile {
         /// The PID of the Python process to monitor
         #[arg(short, long)]
@@ -110,7 +111,7 @@ fn run_profile(
         (pid, None)
     } else {
         // command cannot be None here, this was checked by clap
-        let command = command.unwrap();
+        let command = command.expect("clap should enforce required pid/cmd");
         info!("Starting process with command: {}", command.join(" "));
         let child = std::process::Command::new(&command[0])
             .args(&command[1..])
