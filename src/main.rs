@@ -12,6 +12,7 @@ use dialoguer::theme::ColorfulTheme;
 use dialoguer::Confirm;
 use log::{debug, info, warn};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -107,44 +108,47 @@ fn run_profile(
     std::fs::create_dir_all(&output_dir)?;
     clear_data_dir(&output_dir)?;
 
-    let (pid, child) = if let Some(pid) = pid {
-        (pid, None)
-    } else {
-        // command cannot be None here, this was checked by clap
-        let command = command.expect("clap should enforce required pid/cmd");
-        info!("Starting process with command: {}", command.join(" "));
-        let child = std::process::Command::new(&command[0])
-            .args(&command[1..])
-            .stderr(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .spawn()?;
-        (child.id(), Some(child))
-    };
-    info!("Monitoring process with PID {}", pid);
+    let (pid, _child) = start_profiling_target(pid, command)?;
+    info!("Monitoring process with PID {pid}");
 
-    let tracker = Tracker::new(pid, output_dir.clone(), native);
-    match tracker {
-        Ok(mut tracker) => {
-            while tracker.is_still_tracking() {
-                tracker.tick();
-                thread::sleep(sample_sleep_duration);
-            }
-            info!("All processes have exited, exiting");
-            info!(
-                "View the profile data by running `{} view {:?}`",
-                std::env::current_exe()?.to_string_lossy(),
-                output_dir.to_string_lossy()
-            );
-        }
-        Err(e) => {
-            if let Some(mut child) = child {
-                warn!("Failed to start tracker. Killing process with PID {}.", pid);
-                child.kill()?;
-            }
-            return Err(e);
-        }
+    let mut tracker = Tracker::new(pid, output_dir.clone(), native)?;
+    while tracker.is_still_tracking() {
+        tracker.tick();
+        thread::sleep(sample_sleep_duration);
     }
+
+    info!("All processes have exited, exiting");
+    info!(
+        "View the profile data by running `{} view {}`",
+        std::env::current_exe()?.to_string_lossy(),
+        output_dir.display()
+    );
     Ok(())
+}
+
+fn start_profiling_target(
+    pid: Option<u32>,
+    command: Option<Vec<String>>,
+) -> anyhow::Result<(u32, Option<KillOnDrop>)> {
+    // We are profiling an existing process by pid, so nothing to do here
+    if let Some(pid) = pid {
+        return Ok((pid, None));
+    }
+
+    let command = command.expect("clap should enforce required pid/cmd");
+    // We use the debug display here to correctly chunk arguments with spaces.
+    // Alternatively, we would escape and quote these strings ourselves, to allow
+    // copy-paste-able arguments.
+    info!("Starting process with command {command:?}");
+    info!("The output of the process will be displayed below, mixed with profiling log messages");
+
+    let child = Command::new(&command[0])
+        .args(&command[1..])
+        .stderr(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .spawn()?;
+
+    Ok((child.id(), Some(KillOnDrop(child))))
 }
 
 fn clear_data_dir(dir: &Path) -> anyhow::Result<()> {
@@ -190,4 +194,14 @@ fn run_view(output_dir: PathBuf, interface: &str, port: u16) -> anyhow::Result<(
         .enable_all()
         .build()?
         .block_on(view::run_view(output_dir, interface, port))
+}
+
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Err(e) = self.0.kill() {
+            warn!("Could not kill spawned child process. It might linger around now. Error: {e}")
+        }
+    }
 }
