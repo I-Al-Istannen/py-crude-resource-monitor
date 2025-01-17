@@ -38,6 +38,9 @@ pixi global install py-crude-resource-monitor
 
 > [!NOTE]
 > On some systems, you might need to run the tool as root to be able to capture the process stack traces.
+> If you are using Linux, you can also set the [Yama ptrace
+> scope](https://www.kernel.org/doc/html/latest/admin-guide/LSM/Yama.html#ptrace-scope)
+> to `0` or `1` instead.
 
 ```text
 A small utility to monitor resource usage of Python processes
@@ -57,7 +60,7 @@ Options:
 ```text
 Profile a Python process
 
-Usage: py-crude-resource-monitor profile [OPTIONS] --output-dir <OUTPUT_DIR> [COMMAND]...
+Usage: py-crude-resource-monitor profile [OPTIONS] --output-dir <OUTPUT_DIR> <--pid <PID>|COMMAND>
 
 Arguments:
   [COMMAND]...  The command to execute
