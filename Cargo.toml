@@ -26,5 +26,6 @@ tower = { version = "0.5.2", features = ["util"] }
 snafu = { version = "0.8.5", features = ["std"] }
 flate2 = "1.1.0"
 base64 = "0.22.1"
+[target.'cfg(target_os = "macos")'.dependencies]
 users = "0.11.0"
 shlex = "1.3.0"

@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use std::{env, thread};
-use users::{get_effective_gid, get_effective_uid};
 
 const CLAP_STYLE: Styles = Styles::styled()
     .header(AnsiColor::Red.on_default().bold())
@@ -189,7 +188,7 @@ fn run_profile(
 ) -> Result<(), ApplicationError> {
     #[cfg(target_os = "macos")]
     {
-        let effective_uid = get_effective_uid();
+        let effective_uid = users::get_effective_uid();
         if effective_uid != 0 {
             let args = env::args().collect::<Vec<_>>();
             return Err(InsufficientPermissionsMacOSSnafu {
@@ -259,8 +258,8 @@ fn start_profiling_target(
                 .ok()
                 .map(|s| s.parse::<u32>().expect("SUDO_GID is parseable"));
             info!("Got sudo_uid={sudo_uid:?} and sudo_gid={sudo_gid:?}");
-            let uid = sudo_uid.unwrap_or_else(|| get_effective_uid());
-            let gid = sudo_gid.unwrap_or_else(|| get_effective_gid());
+            let uid = sudo_uid.unwrap_or_else(|| users::get_effective_uid());
+            let gid = sudo_gid.unwrap_or_else(|| users::get_effective_gid());
             info!("Running subprocess with uid={uid:?} and gid={gid:?}");
 
             Command::new(&command[0])
