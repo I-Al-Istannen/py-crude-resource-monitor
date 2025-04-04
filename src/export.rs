@@ -1,6 +1,10 @@
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
+use flate2::Compression;
 use rust_embed::Embed;
 use serde_json::json;
 use snafu::{IntoError, Location, NoneError, ResultExt, Snafu};
+use std::io::Write;
 use std::path::Path;
 
 #[derive(Debug, Snafu)]
@@ -21,6 +25,12 @@ pub enum ExportError {
     #[snafu(display("Error serializing reports at {location}"))]
     SerializeReports {
         source: serde_json::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Error compressing report at {location}"))]
+    CompressReport {
+        source: std::io::Error,
         #[snafu(implicit)]
         location: Location,
     },
@@ -59,9 +69,13 @@ pub fn export_report(data_dir: &Path, output_file: &Path) -> Result<(), ExportEr
         let content =
             std::fs::read(entry.path()).context(ReadReportSnafu { name: name.clone() })?;
 
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&content).context(CompressReportSnafu)?;
+        let data = BASE64_STANDARD.encode(encoder.finish().context(CompressReportSnafu)?);
+
         reports.push(json!({
             "name": name,
-            "data": String::from_utf8_lossy(&content),
+            "data": data,
         }));
     }
 

@@ -170,7 +170,14 @@ export async function fetchReportByName(name: string) {
       alert(`Report '${name}' not found`);
       throw new Error(`Report '${name}' not found`);
     }
-    return parseJsonProcessReport(name, report.data);
+    const parts = new Blob([
+      Uint8Array.from(atob(report.data), (c) => c.charCodeAt(0)),
+    ])
+      .stream()
+      .pipeThrough(new DecompressionStream("gzip"));
+    const data = await new Response(parts).text();
+
+    return parseJsonProcessReport(name, data);
   }
 
   const response = await fetch(`${baseUrl()}/view/${name}`);
@@ -182,4 +189,4 @@ export async function fetchReportByName(name: string) {
   return parseJsonProcessReport(name, await response.text());
 }
 
-const BUNDLED_REPORTS: {name: string, data: string}[] = []
+const BUNDLED_REPORTS: { name: string; data: string }[] = [];
