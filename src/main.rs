@@ -13,7 +13,6 @@ use dialoguer::theme::ColorfulTheme;
 use dialoguer::Confirm;
 use log::{debug, error, info, warn};
 use snafu::{ensure, IntoError, Location, NoneError, Report, ResultExt, Snafu};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -248,6 +247,7 @@ fn start_profiling_target(
 
     #[cfg(target_os = "macos")]
     {
+        use std::os::unix::process::CommandExt;
         let child = {
             // On macOS, you need to run the profile subcommand as sudo to get enough permissions.
             // Switch to the executing user in the subprocess as this is what you want almost always.
