@@ -187,12 +187,13 @@ fn run_profile(
     sample_rate: Option<u64>,
     native: bool,
 ) -> Result<(), ApplicationError> {
-    if cfg!(target_os = "macos") {
+    #[cfg(target_os = "macos")]
+    {
         let effective_uid = get_effective_uid();
         if effective_uid != 0 {
             let args = env::args().collect::<Vec<_>>();
             return Err(InsufficientPermissionsMacOSSnafu {
-                program_command: args.join(" "),
+                program_command: shlex::try_join(args.iter().map(|s| s.as_str())).unwrap(),
             }
             .into_error(NoneError));
         }
@@ -246,38 +247,45 @@ fn start_profiling_target(
     info!("Starting process with command {command:?}");
     info!("The output of the process will be displayed below, mixed with profiling log messages");
 
-    let child = if cfg!(target_os = "macos") {
-        // On macOS, you need to run the profile subcommand as sudo to get enough permissions.
-        // Switch to the executing user in the subprocess as this is what you want almost always.
-        let sudo_uid = env::var("SUDO_UID")
-            .ok()
-            .map(|s| s.parse::<u32>().expect("SUDO_UID is parseable"));
-        let sudo_gid = env::var("SUDO_GID")
-            .ok()
-            .map(|s| s.parse::<u32>().expect("SUDO_GID is parseable"));
-        info!("Got sudo_uid={sudo_uid:?} and sudo_gid={sudo_gid:?}");
-        let uid = sudo_uid.unwrap_or_else(|| get_effective_uid());
-        let gid = sudo_gid.unwrap_or_else(|| get_effective_gid());
-        info!("Running subprocess with uid={uid:?} and gid={gid:?}");
+    #[cfg(target_os = "macos")]
+    {
+        let child = {
+            // On macOS, you need to run the profile subcommand as sudo to get enough permissions.
+            // Switch to the executing user in the subprocess as this is what you want almost always.
+            let sudo_uid = env::var("SUDO_UID")
+                .ok()
+                .map(|s| s.parse::<u32>().expect("SUDO_UID is parseable"));
+            let sudo_gid = env::var("SUDO_GID")
+                .ok()
+                .map(|s| s.parse::<u32>().expect("SUDO_GID is parseable"));
+            info!("Got sudo_uid={sudo_uid:?} and sudo_gid={sudo_gid:?}");
+            let uid = sudo_uid.unwrap_or_else(|| get_effective_uid());
+            let gid = sudo_gid.unwrap_or_else(|| get_effective_gid());
+            info!("Running subprocess with uid={uid:?} and gid={gid:?}");
 
-        Command::new(&command[0])
+            Command::new(&command[0])
+                .args(&command[1..])
+                .stderr(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .uid(uid)
+                .gid(gid)
+                .spawn()
+                .context(TargetCommandStartSnafu { command })?
+        };
+
+        Ok((child.id(), Some(KillOnDrop(child))))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let child = Command::new(&command[0])
             .args(&command[1..])
             .stderr(Stdio::inherit())
             .stdout(Stdio::inherit())
-            .uid(uid)
-            .gid(gid)
             .spawn()
-            .context(TargetCommandStartSnafu { command })?
-    } else {
-        Command::new(&command[0])
-            .args(&command[1..])
-            .stderr(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .spawn()
-            .context(TargetCommandStartSnafu { command })?
-    };
+            .context(TargetCommandStartSnafu { command })?;
 
-    Ok((child.id(), Some(KillOnDrop(child))))
+        Ok((child.id(), Some(KillOnDrop(child))))
+    }
 }
 
 fn clear_data_dir(dir: &Path) -> Result<(), ApplicationError> {
