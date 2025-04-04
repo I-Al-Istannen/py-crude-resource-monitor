@@ -74,6 +74,10 @@ Options:
   -h, --help                       Print help
 ```
 
+> [!NOTE]
+> On macOS, you need root privileges to profile processes.
+> When running `sudo py-crude-resource-manager profile ... -- my-command`, the subprocess will be invoked by the user invoking `sudo` (by using `$SUDO_UID` and `$SUDO_GID`).
+
 ```text
 Host a web server to view the profile data
 

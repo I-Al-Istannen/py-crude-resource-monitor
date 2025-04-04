@@ -13,10 +13,12 @@ use dialoguer::theme::ColorfulTheme;
 use dialoguer::Confirm;
 use log::{debug, error, info, warn};
 use snafu::{ensure, IntoError, Location, NoneError, Report, ResultExt, Snafu};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::thread;
 use std::time::Duration;
+use std::{env, thread};
+use users::{get_current_uid, get_effective_gid, get_effective_uid};
 
 const CLAP_STYLE: Styles = Styles::styled()
     .header(AnsiColor::Red.on_default().bold())
@@ -139,6 +141,10 @@ enum ApplicationError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display(
+        "Insufficient permissions on macOS. Please restart the program using `sudo {program_command}`"
+    ))]
+    InsufficientPermissionsMacOS { program_command: String },
 }
 
 fn main() {
@@ -181,6 +187,17 @@ fn run_profile(
     sample_rate: Option<u64>,
     native: bool,
 ) -> Result<(), ApplicationError> {
+    if cfg!(target_os = "macos") {
+        let effective_uid = get_effective_uid();
+        if effective_uid != 0 {
+            let args = env::args().collect::<Vec<_>>();
+            return Err(InsufficientPermissionsMacOSSnafu {
+                program_command: args.join(" "),
+            }
+            .into_error(NoneError));
+        }
+    }
+
     if native && !cfg!(feature = "unwind") {
         error!("This binary was compiled without support for capturing native stacktraces");
         return Err(MissingUnwindSupportSnafu.into_error(NoneError));
@@ -229,12 +246,36 @@ fn start_profiling_target(
     info!("Starting process with command {command:?}");
     info!("The output of the process will be displayed below, mixed with profiling log messages");
 
-    let child = Command::new(&command[0])
-        .args(&command[1..])
-        .stderr(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .spawn()
-        .context(TargetCommandStartSnafu { command })?;
+    let child = if cfg!(target_os = "macos") {
+        // On macOS, you need to run the profile subcommand as sudo to get enough permissions.
+        // Switch to the executing user in the subprocess as this is what you want almost always.
+        let sudo_uid = env::var("SUDO_UID")
+            .ok()
+            .map(|s| s.parse::<u32>().expect("SUDO_UID is parseable"));
+        let sudo_gid = env::var("SUDO_GID")
+            .ok()
+            .map(|s| s.parse::<u32>().expect("SUDO_GID is parseable"));
+        info!("Got sudo_uid={sudo_uid:?} and sudo_gid={sudo_gid:?}");
+        let uid = sudo_uid.unwrap_or_else(|| get_effective_uid());
+        let gid = sudo_gid.unwrap_or_else(|| get_effective_gid());
+        info!("Running subprocess with uid={uid:?} and gid={gid:?}");
+
+        Command::new(&command[0])
+            .args(&command[1..])
+            .stderr(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .uid(uid)
+            .gid(gid)
+            .spawn()
+            .context(TargetCommandStartSnafu { command })?
+    } else {
+        Command::new(&command[0])
+            .args(&command[1..])
+            .stderr(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .spawn()
+            .context(TargetCommandStartSnafu { command })?
+    };
 
     Ok((child.id(), Some(KillOnDrop(child))))
 }
