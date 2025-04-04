@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use std::{env, thread};
-use users::{get_current_uid, get_effective_gid, get_effective_uid};
+use users::{get_effective_gid, get_effective_uid};
 
 const CLAP_STYLE: Styles = Styles::styled()
     .header(AnsiColor::Red.on_default().bold())
