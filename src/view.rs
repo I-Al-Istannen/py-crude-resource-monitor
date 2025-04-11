@@ -37,10 +37,10 @@ pub async fn run_view(output_dir: PathBuf, interface: &str, port: u16) -> Result
         // nest to ensure the prefix is stripped
         .nest(
             "/view",
-            Router::new().route("/*file", get(serve_profile_data)),
+            Router::new().route("/{*file}", get(serve_profile_data)),
         )
         .route("/", get(|| async { FrontendStaticFile("index.html") }))
-        .route("/*file", get(serve_frontend))
+        .route("/{*file}", get(serve_frontend))
         .layer(CorsLayer::very_permissive())
         .with_state(output_dir);
 
