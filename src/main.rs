@@ -15,7 +15,7 @@ use dialoguer::theme::ColorfulTheme;
 use log::{debug, error, info, warn};
 use snafu::{IntoError, Location, NoneError, Report, ResultExt, Snafu, ensure};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -171,7 +171,7 @@ enum ApplicationError {
     InsufficientPermissionsMacOS { program_command: String },
 }
 
-fn main() -> ExitCode {
+fn main() {
     env_logger::init_from_env(
         env_logger::Env::default().filter_or("RUST_LOG", "py_crude_resource_monitor=info"),
     );
