@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "py-crude-resource-monitor"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum",
