@@ -15,7 +15,7 @@ use dialoguer::theme::ColorfulTheme;
 use log::{debug, error, info, warn};
 use snafu::{IntoError, Location, NoneError, Report, ResultExt, Snafu, ensure};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -105,6 +105,12 @@ enum ApplicationError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Error while waiting for subprocess"))]
+    ChildWait {
+        source: tokio::io::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display("Error setting up webserver runtime at {location}"))]
     TokioInit {
         source: tokio::io::Error,
@@ -165,7 +171,7 @@ enum ApplicationError {
     InsufficientPermissionsMacOS { program_command: String },
 }
 
-fn main() {
+fn main() -> ExitCode {
     env_logger::init_from_env(
         env_logger::Env::default().filter_or("RUST_LOG", "py_crude_resource_monitor=info"),
     );
@@ -184,23 +190,34 @@ fn main() {
             output_dir,
             interface,
             port,
-        } => run_view(output_dir, &interface, port),
+        } => run_view(output_dir, &interface, port).map(|_| None),
         Subcommands::Export { export_subcommand } => match export_subcommand {
             ExportSubcommand::Html {
                 output_dir,
                 output_file,
-            } => export::export_html(&output_dir, &output_file).context(ExportSnafu),
+            } => export::export_html(&output_dir, &output_file)
+                .context(ExportSnafu)
+                .map(|_| None),
             ExportSubcommand::Firefox {
                 output_dir,
                 output_file,
-            } => export::export_firefox(&output_dir, &output_file).context(ExportSnafu),
+            } => export::export_firefox(&output_dir, &output_file)
+                .context(ExportSnafu)
+                .map(|_| None),
         },
     };
 
-    if let Err(e) = res {
-        error!("An error occurred");
-        error!("{}", Report::from_error(e));
-        std::process::exit(1);
+    match res {
+        Err(e) => {
+            error!("An error occurred");
+            error!("{}", Report::from_error(e));
+            std::process::exit(1);
+        }
+        Ok(Some(exit_code)) => {
+            info!("Program exited with code {:?}", exit_code);
+            std::process::exit(exit_code);
+        }
+        _ => std::process::exit(0),
     }
 }
 
@@ -210,7 +227,7 @@ fn run_profile(
     output_dir: PathBuf,
     sample_rate: Option<u64>,
     native: bool,
-) -> Result<(), ApplicationError> {
+) -> Result<Option<i32>, ApplicationError> {
     #[cfg(target_os = "macos")]
     {
         // On macOS, we need to be root to profile processes
@@ -254,13 +271,19 @@ fn run_profile(
         thread::sleep(sample_sleep_duration);
     }
 
-    if quit_requested.load(Ordering::Acquire) {
+    let exit_code = if quit_requested.load(Ordering::Acquire) {
         info!("Termination requested, exiting");
         // Explicitly kill the child now
         drop(_child);
+        None
     } else {
         info!("All processes have exited, exiting");
-    }
+        if let Some(mut child) = _child {
+            child.0.wait().context(ChildWaitSnafu)?.code()
+        } else {
+            None
+        }
+    };
 
     info!(
         "View the profile data by running `{} view {}`",
@@ -269,7 +292,7 @@ fn run_profile(
             .unwrap_or("<this executable>".to_string()),
         output_dir.display()
     );
-    Ok(())
+    Ok(exit_code)
 }
 
 fn start_profiling_target_if_necessary(
