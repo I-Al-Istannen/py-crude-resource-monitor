@@ -8,25 +8,25 @@ license = "MIT"
 unwind = ["py-spy/unwind"]
 
 [dependencies]
-anyhow = "1.0.98"
-clap = "4.5.40"
+anyhow = "1.0.100"
+clap = "4.5.48"
 env_logger = "0.11.8"
-log = "0.4.27"
+log = "0.4.28"
 py-spy = { git = "https://github.com/I-Al-Istannen/py-spy", rev = "cfa2f415a013fcaeb6a795f1992721951cf4e60a" }
-serde_json = "1.0.140"
-sysinfo = "0.35.2"
+serde_json = "1.0.145"
+sysinfo = "0.37.1"
 serde = { version = "1.0.219", features = ["derive"] }
-dialoguer = "0.11.0"
-tokio = { version = "1.45.1", features = ["full"] }
-axum = { version = "0.8.4", features = ["macros"] }
+dialoguer = "0.12.0"
+tokio = { version = "1.47.1", features = ["full"] }
+axum = { version = "0.8.6", features = ["macros"] }
 rust-embed = "8.7.2"
 mime_guess = "2.0.5"
 tower-http = { version = "0.6.6", features = ["cors", "fs"] }
 tower = { version = "0.5.2", features = ["util"] }
-snafu = { version = "0.8.6", features = ["std"] }
+snafu = { version = "0.8.9", features = ["std"] }
 flate2 = "1.1.2"
 base64 = "0.22.1"
-ctrlc = "3.4.7"
+ctrlc = "3.5.0"
 fxprof-processed-profile = "0.8.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
