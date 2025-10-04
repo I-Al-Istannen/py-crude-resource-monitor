@@ -1,11 +1,11 @@
 use crate::export::ReportIdentifier;
 use crate::types::JsonLine;
-use flate2::Compression;
 use flate2::write::GzEncoder;
+use flate2::Compression;
 use fxprof_processed_profile::{
     CategoryColor, CategoryHandle, CounterHandle, CpuDelta, Frame, FrameFlags, FrameInfo,
-    GraphColor, ProcessHandle, Profile, ReferenceTimestamp, SamplingInterval, ThreadHandle,
-    Timestamp,
+    GraphColor, ProcessHandle, Profile, ReferenceTimestamp, SamplingInterval, StackHandle,
+    ThreadHandle, Timestamp,
 };
 use log::info;
 use snafu::{Location, OptionExt, ResultExt, Snafu, Whatever};
@@ -133,13 +133,25 @@ impl ProfileBuilder {
         CpuDelta::from_millis(percent as f64 / 100. * self.interval_millis as f64)
     }
 
+    fn add_global(&mut self, samples: Vec<JsonLine>) -> Result<(), Whatever> {
+        let Some(first_sample) = samples.first() else {
+            return Ok(());
+        };
+        assert!(first_sample.time >= self.start_time_millis);
+
+        ProfileBuilderProcess::new(self, first_sample.time, ReportIdentifier::Global)
+            .add_global(samples)?;
+
+        Ok(())
+    }
+
     fn add_process(&mut self, pid: u32, samples: Vec<JsonLine>) -> Result<(), Whatever> {
         let Some(first_sample) = samples.first() else {
             return Ok(());
         };
         assert!(first_sample.time >= self.start_time_millis);
 
-        ProfileBuilderProcess::new(self, first_sample.time, pid)
+        ProfileBuilderProcess::new(self, first_sample.time, ReportIdentifier::Pid(pid))
             .add_main_thread(samples.iter())?
             .add_samples(samples)?;
 
@@ -154,6 +166,7 @@ impl ProfileBuilder {
 struct MainThreadAdded {
     main_thread_handle: ThreadHandle,
 }
+struct GlobalAdded;
 
 struct ProfileBuilderProcess<'a, T> {
     parent: &'a mut ProfileBuilder,
@@ -167,11 +180,23 @@ struct ProfileBuilderProcess<'a, T> {
 }
 
 impl<'a> ProfileBuilderProcess<'a, ()> {
-    pub fn new(parent: &'a mut ProfileBuilder, start_time_millis: u128, pid: u32) -> Self {
+    pub fn new(
+        parent: &'a mut ProfileBuilder,
+        start_time_millis: u128,
+        identifier: ReportIdentifier,
+    ) -> Self {
         assert!(start_time_millis >= parent.start_time_millis);
 
         let start_timestamp = parent.time(start_time_millis);
-        let process = parent.profile.add_process("Process", pid, start_timestamp);
+        let (pid, process) = match identifier {
+            ReportIdentifier::Global => {
+                (0, parent.profile.add_process("Global", 0, start_timestamp))
+            }
+            ReportIdentifier::Pid(pid) => (
+                pid,
+                parent.profile.add_process("Process", pid, start_timestamp),
+            ),
+        };
 
         // See "renderTrack" for names:
         // https://github.com/firefox-devtools/profiler/blob/main/src/components/timeline/LocalTrack.js#L102
@@ -268,6 +293,59 @@ impl<'a> ProfileBuilderProcess<'a, ()> {
             memory_counter: self.memory_counter,
             io_counter: self.io_counter,
             data: MainThreadAdded { main_thread_handle },
+        })
+    }
+
+    pub fn add_global(
+        mut self,
+        samples: Vec<JsonLine>,
+    ) -> Result<ProfileBuilderProcess<'a, GlobalAdded>, Whatever> {
+        let main_thread = self.parent.profile.add_thread(
+            self.process,
+            0,
+            self.time(self.start_time_millis),
+            true,
+        );
+        for line in samples {
+            assert!(line.time >= self.start_time_millis);
+            let timestamp = self.time(line.time);
+
+            self.memory_counter.add_value(
+                &mut self.parent.profile,
+                timestamp,
+                line.resources.memory as f64,
+            );
+            self.io_counter.add_value(
+                &mut self.parent.profile,
+                timestamp,
+                (line.resources.disk_read_bytes + line.resources.disk_write_bytes) as f64,
+            );
+
+            let cpu_delta = self.cpu(line.resources.cpu);
+            let frame_label = Frame::Label(self.parent.profile.intern_string("Global"));
+            let stack = self.parent.profile.intern_stack_frames(
+                main_thread,
+                vec![FrameInfo {
+                    frame: frame_label,
+                    category_pair: self.parent.category_native.into(),
+                    flags: FrameFlags::empty(),
+                }]
+                .into_iter(),
+            );
+            self.parent
+                .profile
+                .add_sample(main_thread, timestamp, stack, cpu_delta, 1);
+        }
+
+        Ok(ProfileBuilderProcess {
+            parent: self.parent,
+            process: self.process,
+            pid: self.pid,
+            start_time_millis: self.start_time_millis,
+            threads: HashMap::new(),
+            memory_counter: self.memory_counter,
+            io_counter: self.io_counter,
+            data: GlobalAdded,
         })
     }
 }
@@ -440,8 +518,9 @@ fn generate_fxprof(
     let mut builder = ProfileBuilder::from_samples(|| processes.values())?;
 
     for (pid, samples) in processes {
-        if let ReportIdentifier::Pid(pid) = pid {
-            builder.add_process(pid, samples)?;
+        match pid {
+            ReportIdentifier::Pid(pid) => builder.add_process(pid, samples)?,
+            ReportIdentifier::Global => builder.add_global(samples)?,
         }
     }
 
