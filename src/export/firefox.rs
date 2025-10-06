@@ -1,7 +1,7 @@
 use crate::export::ReportIdentifier;
 use crate::types::JsonLine;
-use flate2::Compression;
 use flate2::write::GzEncoder;
+use flate2::Compression;
 use fxprof_processed_profile::{
     CategoryColor, CategoryHandle, CounterHandle, CpuDelta, Frame, FrameFlags, FrameInfo,
     GraphColor, ProcessHandle, Profile, ReferenceTimestamp, SamplingInterval, ThreadHandle,
@@ -152,7 +152,7 @@ impl ProfileBuilder {
         assert!(first_sample.time >= self.start_time_millis);
 
         ProfileBuilderProcess::new(self, first_sample.time, ReportIdentifier::Pid(pid))
-            .add_main_thread(samples.iter())?
+            .add_main_thread(&samples)?
             .add_samples(samples)?;
 
         Ok(())
@@ -234,47 +234,63 @@ impl<'a> ProfileBuilderProcess<'a, ()> {
 
     fn add_main_thread(
         mut self,
-        samples: impl Iterator<Item = impl Borrow<JsonLine>>,
+        samples: &[JsonLine],
     ) -> Result<ProfileBuilderProcess<'a, MainThreadAdded>, Whatever> {
         // adding the main thread first leads to the RAM display corresponding to mainThreadIndex 0 working
         let mut threads = samples
-            .flat_map(|line| line.borrow().stacktraces.clone())
-            .map(|it| {
-                (
-                    it.thread_id,
-                    it.thread_name.clone().unwrap_or("unnamed".to_string()),
-                )
-            })
+            .iter()
+            .flat_map(|it| it.stacktraces.iter())
+            .map(|it| (it.thread_id, it.thread_name.as_deref().unwrap_or("unnamed")))
             .collect::<HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
         // Ensure the report is deterministic
         threads.sort_by(|(a_id, _), (b_id, _)| a_id.cmp(b_id));
 
-        let main_thread = threads.iter().find(|(_, name)| name == MAIN_THREAD_NAME);
+        let main_thread = threads.iter().find(|(_, name)| *name == MAIN_THREAD_NAME);
 
-        let (main_thread_id, _) = match main_thread {
-            Some(thread) => thread,
+        let main_thread_id = match main_thread {
+            Some((thread_id, _)) => *thread_id,
             None => {
-                let all_threads = threads
-                    .iter()
-                    .map(|(_, name)| name.as_str())
-                    .collect::<Vec<_>>();
+                let all_threads = threads.iter().map(|(_, name)| *name).collect::<Vec<_>>();
                 info!(
                     "No main thread found in samples, found threads `{}`.",
                     all_threads.as_slice().join(", ")
                 );
-                let chosen = threads.first().whatever_context("no threads found")?;
+                let mut threads_with_py_frame = samples
+                    .iter()
+                    .flat_map(|it| it.stacktraces.iter())
+                    .filter(|it| it.frames.iter().any(|f| !f.is_entry))
+                    .map(|it| (it.thread_id, it.thread_name.as_deref().unwrap_or("unnamed")))
+                    .collect::<Vec<_>>();
+                threads_with_py_frame.dedup();
+
+                let chosen = if !threads_with_py_frame.is_empty() {
+                    info!(
+                        "Choosing from threads with Python frames: `{}`.",
+                        threads_with_py_frame
+                            .iter()
+                            .map(|(_, name)| *name)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    threads_with_py_frame
+                        .first()
+                        .whatever_context("no threads found")?
+                } else {
+                    threads.first().whatever_context("no threads found")?
+                };
+
                 info!(
                     "Using first thread `{}` with id `{}` as main thread.",
                     chosen.1, chosen.0
                 );
-                chosen
+                chosen.0
             }
         };
         let main_thread_handle = self.parent.profile.add_thread(
             self.process,
-            *main_thread_id as u32,
+            main_thread_id as u32,
             self.time(self.start_time_millis),
             true,
         );
@@ -282,7 +298,7 @@ impl<'a> ProfileBuilderProcess<'a, ()> {
             .profile
             .set_thread_name(main_thread_handle, MAIN_THREAD_NAME);
         self.threads
-            .insert(*main_thread_id as u32, main_thread_handle);
+            .insert(main_thread_id as u32, main_thread_handle);
 
         Ok(ProfileBuilderProcess {
             parent: self.parent,
