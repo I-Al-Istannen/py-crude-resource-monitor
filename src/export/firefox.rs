@@ -1,11 +1,11 @@
 use crate::export::ReportIdentifier;
 use crate::types::JsonLine;
-use flate2::write::GzEncoder;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use fxprof_processed_profile::{
     CategoryColor, CategoryHandle, CounterHandle, CpuDelta, Frame, FrameFlags, FrameInfo,
-    GraphColor, ProcessHandle, Profile, ReferenceTimestamp, SamplingInterval, StackHandle,
-    ThreadHandle, Timestamp,
+    GraphColor, ProcessHandle, Profile, ReferenceTimestamp, SamplingInterval, ThreadHandle,
+    Timestamp,
 };
 use log::info;
 use snafu::{Location, OptionExt, ResultExt, Snafu, Whatever};
@@ -362,8 +362,6 @@ impl<T> ProfileBuilderProcess<'_, T> {
 
 impl ProfileBuilderProcess<'_, MainThreadAdded> {
     pub fn add_samples(mut self, samples: Vec<JsonLine>) -> Result<Self, Whatever> {
-        let mut all_frames = HashMap::new();
-
         for line in samples {
             assert!(line.time >= self.start_time_millis);
             let timestamp = self.time(line.time);
@@ -387,28 +385,28 @@ impl ProfileBuilderProcess<'_, MainThreadAdded> {
 
                 let mut stack_frames = Vec::with_capacity(stacktrace.frames.len());
                 for frame in stacktrace.frames.iter().rev() {
-                    let frame_info = all_frames
-                        .entry((frame.filename.clone(), frame.line))
-                        .or_insert_with(|| FrameInfo {
-                            frame: Frame::Label(
-                                self.parent.profile.intern_string(
-                                    format!(
-                                        "{} ({}:{})",
-                                        frame.name,
-                                        frame.short_filename.as_ref().unwrap(),
-                                        frame.line
-                                    )
-                                    .as_str(),
-                                ),
+                    stack_frames.push(FrameInfo {
+                        frame: Frame::Label(
+                            self.parent.profile.intern_string(
+                                format!(
+                                    "{} ({}:{})",
+                                    frame.name,
+                                    frame
+                                        .short_filename
+                                        .as_deref()
+                                        .unwrap_or(frame.filename.as_str()),
+                                    frame.line
+                                )
+                                .as_str(),
                             ),
-                            category_pair: if frame.is_entry {
-                                self.parent.category_native.into()
-                            } else {
-                                self.parent.category_python.into()
-                            },
-                            flags: FrameFlags::empty(),
-                        });
-                    stack_frames.push(frame_info.clone());
+                        ),
+                        category_pair: if frame.is_entry {
+                            self.parent.category_native.into()
+                        } else {
+                            self.parent.category_python.into()
+                        },
+                        flags: FrameFlags::empty(),
+                    });
                 }
                 let stack = self
                     .parent
