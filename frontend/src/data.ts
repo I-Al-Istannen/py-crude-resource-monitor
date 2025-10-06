@@ -10,7 +10,7 @@ export const StackFrameSchema = z.object({
   name: z.string(),
   filename: z.string(),
   module: z.string().nullable(),
-  short_filename: z.string(),
+  short_filename: z.string().nullable(),
   line: z.number(),
   locals: z.null(), // TODO: What is this
   is_entry: z.boolean(),
