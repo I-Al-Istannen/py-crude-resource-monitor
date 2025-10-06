@@ -1,3 +1,4 @@
+use crate::types::NativeCapture;
 use log::{debug, info};
 use py_spy::{Config, PythonSpy, StackTrace};
 use snafu::{Location, ResultExt, Snafu};
@@ -19,11 +20,12 @@ pub struct SpyHelper {
 }
 
 impl SpyHelper {
-    pub fn new(root: py_spy::Pid, capture_native: bool) -> Result<Self, PySpyError> {
+    pub fn new(root: py_spy::Pid, native_capture: NativeCapture) -> Result<Self, PySpyError> {
         let mut helper = Self {
             spies: HashMap::new(),
             py_spy_config: Config {
-                native: capture_native,
+                native: native_capture.python_stacks(),
+                native_all: native_capture.everything(),
                 ..Default::default()
             },
         };

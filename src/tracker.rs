@@ -1,6 +1,6 @@
 use crate::resources::SystemMeasurements;
 use crate::stacktraces::{PySpyError, SpyHelper};
-use crate::types::{JsonLine, ProcessResources};
+use crate::types::{JsonLine, NativeCapture, ProcessResources};
 use log::{trace, warn};
 use py_spy::StackTrace;
 use snafu::{Location, ResultExt, Snafu};
@@ -41,11 +41,11 @@ impl Tracker {
     pub fn new_with_retry(
         pid: u32,
         output_dir: PathBuf,
-        capture_native: bool,
+        native_capture: NativeCapture,
     ) -> Result<Self, TrackerError> {
         let mut last_err = None;
         for _ in 0..5 {
-            match Self::new(pid, output_dir.clone(), capture_native) {
+            match Self::new(pid, output_dir.clone(), native_capture) {
                 Ok(tracker) => return Ok(tracker),
                 Err(e) => {
                     warn!("Got error during attach, will retry. ({e})");
@@ -57,9 +57,13 @@ impl Tracker {
         Err(last_err.unwrap())
     }
 
-    fn new(pid: u32, output_dir: PathBuf, capture_native: bool) -> Result<Self, TrackerError> {
+    fn new(
+        pid: u32,
+        output_dir: PathBuf,
+        native_capture: NativeCapture,
+    ) -> Result<Self, TrackerError> {
         let system = SystemMeasurements::new();
-        let spy_helper = SpyHelper::new(pid as py_spy::Pid, capture_native).context(PySpySnafu)?;
+        let spy_helper = SpyHelper::new(pid as py_spy::Pid, native_capture).context(PySpySnafu)?;
 
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(100);
 

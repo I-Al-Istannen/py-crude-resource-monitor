@@ -1372,6 +1372,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2355d85b9a3786f481747ced0e0ff2ba35213a1f9bd406ed906554d7af805a1"
 
 [[package]]
+name = "page_size"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30d5b2194ed13191c1999ae0704b7839fb18384fa22e49b57eeaa97d79ce40da"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1529,8 +1539,8 @@ dependencies = [
 
 [[package]]
 name = "py-spy"
-version = "0.4.0"
-source = "git+https://github.com/I-Al-Istannen/py-spy?rev=cfa2f415a013fcaeb6a795f1992721951cf4e60a#cfa2f415a013fcaeb6a795f1992721951cf4e60a"
+version = "0.4.1"
+source = "git+https://github.com/I-Al-Istannen/py-spy?rev=7fde2d8452e3c72204772a87645aeaa4cfe80b6b#7fde2d8452e3c72204772a87645aeaa4cfe80b6b"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1549,6 +1559,7 @@ dependencies = [
  "lru",
  "memmap2",
  "num-traits",
+ "page_size",
  "proc-maps",
  "rand",
  "rand_distr",
@@ -1679,7 +1690,7 @@ checksum = "2b15c43186be67a4fd63bee50d0303afffcef381492ebe2c5d87f324e1b8815c"
 [[package]]
 name = "remoteprocess"
 version = "0.5.1"
-source = "git+https://github.com/I-Al-Istannen/remoteprocess?rev=b022ea4d581e32c747ef7f84e162e51e3c672afd#b022ea4d581e32c747ef7f84e162e51e3c672afd"
+source = "git+https://github.com/I-Al-Istannen/remoteprocess?rev=ffbf9b5a5bb67adf184084643b9daee2ac9fe70a#ffbf9b5a5bb67adf184084643b9daee2ac9fe70a"
 dependencies = [
  "addr2line 0.25.0",
  "cfg-if",

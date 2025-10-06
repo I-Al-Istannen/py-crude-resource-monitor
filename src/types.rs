@@ -1,6 +1,9 @@
+use clap::ValueEnum;
+use clap::builder::PossibleValue;
 use py_spy::Pid;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::Display;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct JsonLine {
@@ -114,6 +117,59 @@ impl From<py_spy::stack_trace::ProcessInfo> for ProcessInfo {
             pid: info.pid,
             command_line: info.command_line,
             parent: info.parent.map(|p| Box::new((*p).into())),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub enum NativeCapture {
+    NativeStacks,
+    AllNative,
+    None,
+}
+
+impl NativeCapture {
+    pub fn python_stacks(&self) -> bool {
+        matches!(self, Self::NativeStacks | Self::AllNative)
+    }
+
+    pub fn everything(&self) -> bool {
+        matches!(self, Self::AllNative)
+    }
+
+    pub fn anything(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+impl Display for NativeCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let str = match self {
+            Self::NativeStacks => "native-stacks".to_string(),
+            Self::AllNative => "all".to_string(),
+            Self::None => "none".to_string(),
+        };
+        write!(f, "{}", str)
+    }
+}
+
+impl ValueEnum for NativeCapture {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::NativeStacks, Self::AllNative, Self::None]
+    }
+
+    fn to_possible_value(&self) -> Option<PossibleValue> {
+        match self {
+            Self::NativeStacks => Some(
+                PossibleValue::new("native-stacks")
+                    .help("Capture native stacks only for threads with Python frames."),
+            ),
+            Self::AllNative => {
+                Some(PossibleValue::new("all").help("Capture native stacks for all threads."))
+            }
+            Self::None => {
+                Some(PossibleValue::new("none").help("Do not capture any native stacks."))
+            }
         }
     }
 }

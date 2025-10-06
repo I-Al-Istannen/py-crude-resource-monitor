@@ -6,6 +6,7 @@ mod types;
 mod view;
 
 use crate::tracker::{Tracker, TrackerError};
+use crate::types::NativeCapture;
 use crate::view::ViewError;
 use clap::builder::Styles;
 use clap::builder::styling::AnsiColor;
@@ -53,13 +54,13 @@ enum Subcommands {
         #[arg(short, long)]
         sample_rate: Option<u64>,
         #[cfg(feature = "unwind")]
-        /// capture native stack traces
-        #[arg(long)]
-        native: bool,
+        /// capture native stack traces. If given without a value, defaults to `native-stacks`.
+        #[arg(long, default_value_t = NativeCapture::None, default_missing_value = "native-stacks", num_args(0..=1))]
+        native: NativeCapture,
         #[cfg(not(feature = "unwind"))]
         /// capture native stack traces (not compiled, enable with `unwind` build feature)
-        #[arg(long)]
-        native: bool,
+        #[arg(long, default_value_t = NativeCapture::None, default_missing_value = "native-stacks", num_args(0..=1))]
+        native: NativeCapture,
     },
     /// Host a web server to view the profile data
     View {
@@ -242,7 +243,7 @@ fn run_profile(
     command: Option<Vec<String>>,
     output_dir: PathBuf,
     sample_rate: Option<u64>,
-    native: bool,
+    native_capture: NativeCapture,
 ) -> Result<Option<ExitStatus>, ApplicationError> {
     #[cfg(target_os = "macos")]
     {
@@ -256,7 +257,7 @@ fn run_profile(
         }
     }
 
-    if native && !cfg!(feature = "unwind") {
+    if native_capture.anything() && !cfg!(feature = "unwind") {
         error!("This binary was compiled without support for capturing native stacktraces");
         return Err(MissingUnwindSupportSnafu.into_error(NoneError));
     }
@@ -280,7 +281,7 @@ fn run_profile(
     info!("Monitoring process with PID {pid}");
 
     let mut tracker =
-        Tracker::new_with_retry(pid, output_dir.clone(), native).context(TrackerSnafu)?;
+        Tracker::new_with_retry(pid, output_dir.clone(), native_capture).context(TrackerSnafu)?;
     info!("Tracking started");
     while tracker.is_still_tracking() && !quit_requested.load(Ordering::Acquire) {
         tracker.tick();
