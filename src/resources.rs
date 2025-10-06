@@ -39,7 +39,8 @@ impl SystemMeasurements {
     pub fn get_process_info(&mut self, pid: sysinfo::Pid) -> Option<ProcessResources> {
         let process = self.system.process(pid)?;
 
-        let cpu_usage = process.cpu_usage();
+        // Normalize cpu usage to number of cores, as firefox profiler can only render up to 100%
+        let cpu_usage = process.cpu_usage() / (self.system.cpus().len().max(1) as f32);
         let memory = process.memory();
 
         let thread_resources = process
