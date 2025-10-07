@@ -5,6 +5,7 @@ mod tracker;
 mod types;
 mod view;
 
+use crate::export::FirefoxExportArguments;
 use crate::tracker::{Tracker, TrackerError};
 use crate::types::NativeCapture;
 use crate::view::ViewError;
@@ -90,12 +91,7 @@ enum ExportSubcommand {
         output_file: PathBuf,
     },
     /// Exports to the Firefox Profiler's processed profile JSON format
-    Firefox {
-        /// The directory containing the profile data
-        output_dir: PathBuf,
-        /// The output file to write the gz-compressed JSON to
-        output_file: PathBuf,
-    },
+    Firefox(FirefoxExportArguments),
 }
 
 #[derive(Debug, Snafu)]
@@ -200,10 +196,7 @@ fn main() -> Result<(), ApplicationError> {
             } => export::export_html(&output_dir, &output_file)
                 .context(ExportSnafu)
                 .map(|_| None)?,
-            ExportSubcommand::Firefox {
-                output_dir,
-                output_file,
-            } => export::export_firefox(&output_dir, &output_file)
+            ExportSubcommand::Firefox(args) => export::export_firefox(args)
                 .context(ExportSnafu)
                 .map(|_| None)?,
         },

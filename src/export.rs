@@ -3,6 +3,8 @@ use snafu::{Location, ResultExt, Snafu, Whatever};
 use std::collections::HashMap;
 use std::path::Path;
 
+pub use firefox::FirefoxExportArguments;
+
 mod firefox;
 mod html;
 
@@ -28,8 +30,8 @@ pub fn export_html(data_dir: &Path, output_file: &Path) -> Result<(), ExportErro
 }
 
 /// Exports the profile data to a Firefox-compatible JSON report.
-pub fn export_firefox(data_dir: &Path, output_file: &Path) -> Result<(), ExportError> {
-    firefox::export_report(data_dir, output_file).context(FirefoxSnafu)
+pub fn export_firefox(args: FirefoxExportArguments) -> Result<(), ExportError> {
+    firefox::export_report(args).context(FirefoxSnafu)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

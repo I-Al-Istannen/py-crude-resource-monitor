@@ -1,7 +1,7 @@
 use crate::export::ReportIdentifier;
 use crate::types::JsonLine;
-use flate2::write::GzEncoder;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use fxprof_processed_profile::{
     CategoryColor, CategoryHandle, CounterHandle, CpuDelta, Frame, FrameFlags, FrameInfo,
     GraphColor, ProcessHandle, Profile, ReferenceTimestamp, SamplingInterval, ThreadHandle,
@@ -13,7 +13,7 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::marker::PhantomData;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const MAIN_THREAD_NAME: &str = "MainThread";
 const CATEGORY_PYTHON_NAME: &str = "Python";
@@ -61,16 +61,22 @@ struct ProfileBuilder {
     profile: Profile,
     category_native: CategoryHandle,
     category_python: CategoryHandle,
+    include_bandwidth: bool,
 }
 
 impl ProfileBuilder {
     pub fn from_samples<'a, T: Iterator<Item = &'a Vec<JsonLine>>>(
         samples: impl Fn() -> T,
+        include_bandwidth: bool,
     ) -> Result<Self, Whatever> {
         let start_time_millis = Self::start_time(samples().flat_map(|lines| lines.iter()))?;
         let interval_millis = Self::sampling_interval(samples().flat_map(|lines| lines.iter()))?;
 
-        Ok(Self::new(start_time_millis, interval_millis))
+        Ok(Self::new(
+            start_time_millis,
+            interval_millis,
+            include_bandwidth,
+        ))
     }
 
     pub fn start_time(
@@ -105,7 +111,7 @@ impl ProfileBuilder {
             .whatever_context("no samples found")
     }
 
-    pub fn new(start_time_millis: u128, interval_millis: u64) -> Self {
+    pub fn new(start_time_millis: u128, interval_millis: u64, include_bandwidth: bool) -> Self {
         let mut profile = Profile::new(
             // TODO: Add metadata to original data json files
             "python",
@@ -122,6 +128,7 @@ impl ProfileBuilder {
             start_time_millis,
             category_native,
             category_python,
+            include_bandwidth,
         }
     }
 
@@ -175,7 +182,7 @@ struct ProfileBuilderProcess<'a, T> {
     start_time_millis: u128,
     threads: HashMap<u32, ThreadHandle>,
     memory_counter: ProfileCounter<Initialized>,
-    io_counter: ProfileCounter<Initialized>,
+    io_counter: Option<ProfileCounter<Initialized>>,
     data: T,
 }
 
@@ -210,15 +217,21 @@ impl<'a> ProfileBuilderProcess<'a, ()> {
             GraphColor::Orange,
         )
         .initialize(&mut parent.profile, start_timestamp, 0.);
-        let io_counter = ProfileCounter::new(
-            &mut parent.profile,
-            process,
-            "io",
-            "Bandwidth",
-            "I/O read/write in bytes",
-            GraphColor::Teal,
-        )
-        .initialize(&mut parent.profile, start_timestamp, 0.);
+        let io_counter = if parent.include_bandwidth {
+            Some(
+                ProfileCounter::new(
+                    &mut parent.profile,
+                    process,
+                    "io",
+                    "Bandwidth",
+                    "I/O read/write in bytes",
+                    GraphColor::Teal,
+                )
+                .initialize(&mut parent.profile, start_timestamp, 0.),
+            )
+        } else {
+            None
+        };
 
         Self {
             parent,
@@ -331,11 +344,13 @@ impl<'a> ProfileBuilderProcess<'a, ()> {
                 timestamp,
                 line.resources.memory as f64,
             );
-            self.io_counter.add_value(
-                &mut self.parent.profile,
-                timestamp,
-                (line.resources.disk_read_bytes + line.resources.disk_write_bytes) as f64,
-            );
+            if let Some(io_counter) = self.io_counter.as_mut() {
+                io_counter.add_value(
+                    &mut self.parent.profile,
+                    timestamp,
+                    (line.resources.disk_read_bytes + line.resources.disk_write_bytes) as f64,
+                );
+            }
 
             let cpu_delta = self.cpu(line.resources.cpu);
             let frame_label = Frame::Label(self.parent.profile.intern_string("Global"));
@@ -450,11 +465,13 @@ impl ProfileBuilderProcess<'_, MainThreadAdded> {
                 timestamp,
                 line.resources.memory as f64,
             );
-            self.io_counter.add_value(
-                &mut self.parent.profile,
-                timestamp,
-                (line.resources.disk_read_bytes + line.resources.disk_write_bytes) as f64,
-            );
+            if let Some(io_counter) = self.io_counter.as_mut() {
+                io_counter.add_value(
+                    &mut self.parent.profile,
+                    timestamp,
+                    (line.resources.disk_read_bytes + line.resources.disk_write_bytes) as f64,
+                );
+            }
         }
 
         Ok(self)
@@ -511,16 +528,27 @@ impl ProfileCounter<Initialized> {
     }
 }
 
-pub(super) fn export_report(data_dir: &Path, output_path: &Path) -> Result<(), ExportError> {
-    let process_to_profile = super::read_report(data_dir).context(ReadReportSnafu)?;
+#[derive(clap::Args, Debug)]
+pub struct FirefoxExportArguments {
+    /// Whether to include bandwidth usage in the export
+    #[arg(long, default_value_t = false)]
+    bandwidth: bool,
+    /// The directory containing the profile data
+    data_dir: PathBuf,
+    /// The output file to write the gz-compressed JSON to
+    output_file: PathBuf,
+}
 
-    let profile = generate_fxprof(process_to_profile).context(FirefoxProfileSnafu)?;
+pub(super) fn export_report(args: FirefoxExportArguments) -> Result<(), ExportError> {
+    let process_to_profile = super::read_report(&args.data_dir).context(ReadReportSnafu)?;
 
-    write_profile(output_path, profile)?;
+    let profile = generate_fxprof(process_to_profile, &args).context(FirefoxProfileSnafu)?;
+
+    write_profile(&args.output_file, profile)?;
 
     info!(
         "Wrote Firefox profile to {}. Open it in `https://profiler.firefox.com`.",
-        output_path.display()
+        &args.output_file.display()
     );
 
     Ok(())
@@ -528,8 +556,9 @@ pub(super) fn export_report(data_dir: &Path, output_path: &Path) -> Result<(), E
 
 fn generate_fxprof(
     processes: HashMap<ReportIdentifier, Vec<JsonLine>>,
+    args: &FirefoxExportArguments,
 ) -> Result<Profile, Whatever> {
-    let mut builder = ProfileBuilder::from_samples(|| processes.values())?;
+    let mut builder = ProfileBuilder::from_samples(|| processes.values(), args.bandwidth)?;
 
     for (pid, samples) in processes {
         match pid {
