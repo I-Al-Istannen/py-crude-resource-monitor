@@ -46,7 +46,8 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install libunwind-dev build-essential -y
+          sudo apt-get install libunwind-dev build-essential liblzma-dev -y
+          echo 'RUSTFLAGS=-C link-arg=-llzma' >> $GITHUB_ENV
 
       - name: Build
         run: |
