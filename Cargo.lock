@@ -1540,7 +1540,7 @@ dependencies = [
 [[package]]
 name = "py-spy"
 version = "0.4.1"
-source = "git+https://github.com/I-Al-Istannen/py-spy?rev=6b2b6f459a4e039ff4f134440b97d1c3bbbad6e7#6b2b6f459a4e039ff4f134440b97d1c3bbbad6e7"
+source = "git+https://github.com/I-Al-Istannen/py-spy?rev=ff23a716023ca39ab68f29cccd6920d7aff0affc#ff23a716023ca39ab68f29cccd6920d7aff0affc"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1690,7 +1690,7 @@ checksum = "2b15c43186be67a4fd63bee50d0303afffcef381492ebe2c5d87f324e1b8815c"
 [[package]]
 name = "remoteprocess"
 version = "0.5.1"
-source = "git+https://github.com/I-Al-Istannen/remoteprocess?rev=ed9a8c4f736aed083d398434233a0fc9f37734e1#ed9a8c4f736aed083d398434233a0fc9f37734e1"
+source = "git+https://github.com/I-Al-Istannen/remoteprocess?rev=8b3e94775ac8888c7470b82fa3c1d13757bf619a#8b3e94775ac8888c7470b82fa3c1d13757bf619a"
 dependencies = [
  "addr2line 0.25.0",
  "cfg-if",
