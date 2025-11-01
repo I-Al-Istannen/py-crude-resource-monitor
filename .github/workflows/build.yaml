@@ -31,7 +31,7 @@ jobs:
             os: macos-13
             unwind: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -54,7 +54,7 @@ jobs:
           cargo build --release ${{ matrix.unwind && '--features unwind' || '' }} --target ${{ matrix.target }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: binaries-${{ matrix.target }}
           path: |
@@ -64,7 +64,7 @@ jobs:
   build-static-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - uses: pnpm/action-setup@v4
@@ -88,7 +88,7 @@ jobs:
             bash -c 'cd /work && SKIP_FRONTEND_BUILD=yes cargo build --release --features unwind --target x86_64-unknown-linux-musl'
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: binaries-x86_64-unknown-linux-musl
           path: |
