@@ -12,7 +12,9 @@ anyhow = "1.0.98"
 clap = "4.5.40"
 env_logger = "0.11.8"
 log = "0.4.27"
-py-spy = { git = "https://github.com/I-Al-Istannen/py-spy", rev = "ff23a716023ca39ab68f29cccd6920d7aff0affc" }
+#py-spy = { git = "https://github.com/I-Al-Istannen/py-spy", rev = "ff23a716023ca39ab68f29cccd6920d7aff0affc" }
+py-spy = { git = "https://github.com/I-Al-Istannen/py-spy", rev = "7341b1b8fdd53d26226eedf86c2573d53318aea4" }
+#py-spy = { path = "../py-spy" }
 serde_json = "1.0.140"
 sysinfo = "0.35.2"
 serde = { version = "1.0.219", features = ["derive"] }
