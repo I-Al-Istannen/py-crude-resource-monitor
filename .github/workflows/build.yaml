@@ -28,16 +28,19 @@ jobs:
             os: macos-latest
             unwind: false
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             unwind: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
-          version: 9
+          version: 12
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -54,7 +57,7 @@ jobs:
           cargo build --release ${{ matrix.unwind && '--features unwind' || '' }} --target ${{ matrix.target }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.target }}
           path: |
@@ -64,14 +67,17 @@ jobs:
   build-static-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
-          version: 9
+          version: 12
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
 
-      - name: Build prontend
+      - name: Build frontend
         run: |
           # The musl build image has no node, so build.rs can't do this for us
           cd frontend
@@ -88,7 +94,7 @@ jobs:
             bash -c 'cd /work && SKIP_FRONTEND_BUILD=yes cargo build --release --features unwind --target x86_64-unknown-linux-musl'
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-x86_64-unknown-linux-musl
           path: |
