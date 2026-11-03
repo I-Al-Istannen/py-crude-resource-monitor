@@ -167,8 +167,12 @@ function buildPlotOptions(plotData: PlotData, colors: string[]): uPlot.Options {
   return options;
 }
 
+function seriesLabel(series: uPlot.Series): string | undefined {
+  return series.label instanceof HTMLElement ? series.label.textContent : series.label;
+}
+
 function isGlobalSeries(series: uPlot.Series): boolean {
-  return !!series.label?.includes("global.json")
+  return !!seriesLabel(series)?.includes("global.json")
 }
 
 export function buildPlot(plotData: PlotData): uPlot {
@@ -197,13 +201,13 @@ export function buildPlot(plotData: PlotData): uPlot {
   document.getElementById("plotOptionsOnlyMem")!.onclick = () => {
     for (let i = 0; i < plot.series.length; i++) {
       const series = plot.series[i];
-      plot.setSeries(i, { show: series.label?.includes("RAM") && !isGlobalSeries(series) });
+      plot.setSeries(i, { show: seriesLabel(series)?.includes("RAM") && !isGlobalSeries(series) });
     }
   };
   document.getElementById("plotOptionsOnlyCpu")!.onclick = () => {
     for (let i = 0; i < plot.series.length; i++) {
       const series = plot.series[i];
-      plot.setSeries(i, { show: series.label?.includes("CPU") && !isGlobalSeries(series) });
+      plot.setSeries(i, { show: seriesLabel(series)?.includes("CPU") && !isGlobalSeries(series) });
     }
   };
 
