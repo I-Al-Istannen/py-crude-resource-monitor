@@ -108,7 +108,7 @@ impl From<py_spy::stack_trace::LocalVariable> for LocalVariable {
 pub struct ProcessInfo {
     pub pid: Pid,
     pub command_line: String,
-    pub parent: Option<Box<ProcessInfo>>,
+    pub parent: Option<Box<Self>>,
 }
 
 impl From<py_spy::stack_trace::ProcessInfo> for ProcessInfo {

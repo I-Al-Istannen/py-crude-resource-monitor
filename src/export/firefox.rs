@@ -258,7 +258,7 @@ impl<'a> ProfileBuilderProcess<'a, ()> {
             .into_iter()
             .collect::<Vec<_>>();
         // Ensure the report is deterministic
-        threads.sort_by(|(a_id, _), (b_id, _)| a_id.cmp(b_id));
+        threads.sort_by_key(|(a_id, _)| *a_id);
 
         let main_thread = threads.iter().find(|(_, name)| *name == MAIN_THREAD_NAME);
 
@@ -548,7 +548,7 @@ pub(super) fn export_report(args: FirefoxExportArguments) -> Result<(), ExportEr
 
     info!(
         "Wrote Firefox profile to {}. Open it in `https://profiler.firefox.com`.",
-        &args.output_file.display()
+        args.output_file.display()
     );
 
     Ok(())
