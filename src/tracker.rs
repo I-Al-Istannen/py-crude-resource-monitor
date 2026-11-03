@@ -20,6 +20,12 @@ pub enum TrackerError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Error initializing system measurements at {location}"))]
+    SystemMeasurements {
+        source: sysinfo::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -62,7 +68,7 @@ impl Tracker {
         output_dir: PathBuf,
         native_capture: NativeCapture,
     ) -> Result<Self, TrackerError> {
-        let system = SystemMeasurements::new();
+        let system = SystemMeasurements::new().context(SystemMeasurementsSnafu)?;
         let spy_helper = SpyHelper::new(pid as py_spy::Pid, native_capture).context(PySpySnafu)?;
 
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(100);

@@ -11,17 +11,17 @@ pub struct SystemMeasurements {
 }
 
 impl SystemMeasurements {
-    pub fn new() -> Self {
-        Self {
-            system: sysinfo::System::new(),
-            disk: sysinfo::Disks::new(),
-        }
+    pub fn new() -> Result<Self, sysinfo::Error> {
+        Ok(Self {
+            system: sysinfo::System::new()?,
+            disk: sysinfo::Disks::new()?,
+        })
     }
 
     pub fn refresh(&mut self) {
         self.system.refresh_specifics(
             RefreshKind::default()
-                .with_cpu(CpuRefreshKind::default().with_cpu_usage())
+                .with_cpu(CpuRefreshKind::default().with_usage())
                 .with_processes(
                     ProcessRefreshKind::default()
                         .with_cpu()
