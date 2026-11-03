@@ -70,21 +70,21 @@ jobs:
       - uses: pnpm/action-setup@v4
         with:
           version: 9
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
 
       - name: Build prontend
         run: |
-          # The build.rs does not work in alpine, so we need to do this manually
+          # The musl build image has no node, so build.rs can't do this for us
           cd frontend
           pnpm install
           pnpm build
 
+      - name: Build musl build image
+        run: docker build -t musl-builder -f .github/docker/musl.Dockerfile .github/docker
+
       - name: Build main program
         run: |
-          # We skip the frontend build here, as we already did it and it does not work in alpine
-          docker run --rm -v "$PWD:/work" ghcr.io/benfred/rust-musl-cross:x86_64-unknown-linux-musl \
+          # We skip the frontend build here, as we already did it and the image has no node
+          docker run --rm -v "$PWD:/work" musl-builder \
             bash -c 'cd /work && SKIP_FRONTEND_BUILD=yes cargo build --release --features unwind --target x86_64-unknown-linux-musl'
 
       - name: Upload artifacts
