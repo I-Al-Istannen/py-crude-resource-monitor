@@ -1,8 +1,8 @@
 """Many short-lived Python child processes, each running for a fraction of a second.
 
-Shows a limitation: processes are discovered when a sample is taken and need to be attached to
-first. Children that live shorter than about one sampling interval are mostly missed, so their CPU
-usage is not attributed to them (it is still part of the global graph).
+Shows a limitation: processes are discovered when a sample is taken. Children that live shorter
+than one sampling interval are missed if no sample falls into their lifetime, and the CPU time a
+child uses after its last sample is lost. Their CPU usage is still part of the global graph.
 """
 
 import resource

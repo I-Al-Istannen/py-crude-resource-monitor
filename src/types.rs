@@ -12,8 +12,21 @@ pub struct JsonLine {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stacktrace_error: Option<String>,
     pub resources: ProcessResources,
+    /// Missing in profiles written by older versions and in the global data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessMetadata>,
     pub index: usize,
     pub time: u128,
+}
+
+/// Identifies a process. Pids can be reused, so a file might contain several processes with
+/// different start times.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessMetadata {
+    pub name: String,
+    pub parent_pid: Option<u32>,
+    /// Seconds since the unix epoch
+    pub start_time: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +214,7 @@ mod tests {
         let line = JsonLine {
             stacktraces: vec![],
             stacktrace_error: None,
+            process: None,
             resources: ProcessResources {
                 memory: 1,
                 cpu: 2.0,

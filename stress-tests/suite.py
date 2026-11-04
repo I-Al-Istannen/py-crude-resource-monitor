@@ -107,8 +107,11 @@ class Profile:
         return self._firefox["threads"]
 
     def cpu_seconds(self, samples: list[dict]) -> float:
-        """Integrates the CPU usage of consecutive samples of one process over time."""
-        total = 0.0
+        """Integrates the CPU usage of consecutive samples of one process over time. The first
+        sample covers the time since the previous tick, about one interval."""
+        if not samples:
+            return 0.0
+        total = self.process_cores(samples[0]) * self.interval / 1000
         for previous, current in zip(samples, samples[1:]):
             total += self.process_cores(current) * (current["time"] - previous["time"]) / 1000
         return total
@@ -259,13 +262,18 @@ def check_shared_overcount(profile, truth, phase, check):
     )
 
 
-def check_untracked_process(profile, truth, phase, check):
-    cores = phase["child_cpu_seconds"] / duration_seconds(phase)
-    tracked = phase["child_pid"] in profile.processes
+def check_child_cpu(profile, truth, phase, check):
+    """CPU usage of a child process that is not necessarily a Python process."""
+    samples = profile.window(phase["child_pid"], phase["start"], phase["end"])
+    expected = phase["child_cpu_seconds"] / duration_seconds(phase)
+    if not samples:
+        return FAIL, f"child using {expected:.2f} cores", "no data for child"
+    measured = statistics.mean(profile.process_cores(s) for s in samples)
+    status = PASS if within(measured, expected, 0.15, 0.1) else FAIL
     return (
-        INFO if tracked else LIMITATION,
-        f"child using {cores:.2f} cores",
-        "child profiled" if tracked else "no data for child",
+        status,
+        f"child using {expected:.2f} cores",
+        f"{measured:.2f} cores ({len(samples)} samples)",
     )
 
 
@@ -316,7 +324,7 @@ CHECKS = {
     "growth_attribution": check_growth_attribution,
     "peak_missed": check_peak_missed,
     "shared_overcount": check_shared_overcount,
-    "untracked_process": check_untracked_process,
+    "child_cpu": check_child_cpu,
     "global_cpu_delta": check_global_cpu_delta,
     "child_coverage": check_child_coverage,
     "cpu_integral": check_cpu_integral,

@@ -29,8 +29,8 @@ Every check has one of these outcomes:
 | `cpu_single_thread` | CPU follows a busy loop and samples point at the busy function. Also the CPU integral over the whole run.      |
 | `gil_threads`       | Four GIL-bound threads share one core, four GIL-releasing threads use four. Per-thread CPU makes this visible. |
 | `pool_cpu`          | Pool workers are discovered and accounted separately, the parent is idle in `Pool.map`.                        |
-| `child_processes`   | Python grandchildren behind a shell are profiled, non-Python children only show up in the global CPU.          |
-| `short_lived`       | *Limitation*: children living shorter than a few sampling intervals get no CPU attributed.                     |
+| `child_processes`   | Python grandchildren behind a shell are profiled, non-Python children get resources without stacks.           |
+| `short_lived`       | *Limitation*: children living shorter than a sampling interval get only part of their CPU attributed.         |
 | `memory_steps`      | RSS follows allocations and frees, memory growth is attributed to the function that allocates.                 |
 | `memory_semantics`  | Reserved-but-untouched memory does not count, memory from native `malloc` does (tracemalloc misses it).        |
 | `memory_spike`      | *Limitation*: spikes shorter than the sampling interval are missed.                                            |
