@@ -42,7 +42,7 @@ pixi global install py-crude-resource-monitor
 > scope](https://www.kernel.org/doc/html/latest/admin-guide/LSM/Yama.html#ptrace-scope)
 > to `0` or `1` instead.
 > If you are on macOS, you need root privileges to profile processes.
-> When running `sudo py-crude-resource-manager profile ... -- my-command`, the subprocess will be invoked by the user invoking `sudo` (by using `$SUDO_UID` and `$SUDO_GID`).
+> When running `sudo py-crude-resource-monitor profile ... -- my-command`, the subprocess will be invoked by the user invoking `sudo` (by using `$SUDO_UID` and `$SUDO_GID`).
 
 ```text
 A small utility to monitor resource usage of Python processes
@@ -72,8 +72,12 @@ Options:
   -p, --pid <PID>                  The PID of the Python process to monitor
   -o, --output-dir <OUTPUT_DIR>    output directory
   -s, --sample-rate <SAMPLE_RATE>  ms between samples
-      --native                     capture native stack traces
-  -h, --help                       Print help
+  -y, --yes                        Delete samples from a previous run in the output directory
+                                   without asking
+      --native [<NATIVE>]          capture native stack traces. If given without a value, defaults
+                                   to `native-stacks`. [default: none] [possible values:
+                                   native-stacks, all, none]
+  -h, --help                       Print help (see more with '--help')
 ```
 
 ```text
@@ -86,7 +90,8 @@ Arguments:
 
 Options:
       --port <PORT>            The port to listen on [default: 3000]
-      --interface <INTERFACE>  The interface to listen on [default: 0.0.0.0]
+      --interface <INTERFACE>  The interface to listen on. Use `0.0.0.0` to make the viewer
+                               reachable from other machines [default: 127.0.0.1]
   -h, --help                   Print help
 ```
 
@@ -106,12 +111,13 @@ Options:
 ```text
 Exports to the Firefox Profiler's processed profile JSON format
 
-Usage: py-crude-resource-monitor export firefox <OUTPUT_DIR> <OUTPUT_FILE>
+Usage: py-crude-resource-monitor export firefox [OPTIONS] <DATA_DIR> <OUTPUT_FILE>
 
 Arguments:
-  <OUTPUT_DIR>   The directory containing the profile data
+  <DATA_DIR>     The directory containing the profile data
   <OUTPUT_FILE>  The output file to write the gz-compressed JSON to
 
 Options:
-  -h, --help  Print help
+      --bandwidth  Whether to include bandwidth usage in the export
+  -h, --help       Print help
 ```
