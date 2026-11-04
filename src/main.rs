@@ -277,10 +277,18 @@ fn run_profile(
     let mut tracker =
         Tracker::new_with_retry(pid, output_dir.clone(), native_capture).context(TrackerSnafu)?;
     info!("Tracking started");
+    let mut tick_result = Ok(());
     while tracker.is_still_tracking() && !quit_requested.load(Ordering::Acquire) {
-        tracker.tick();
+        tick_result = tracker.tick();
+        if tick_result.is_err() {
+            break;
+        }
         thread::sleep(sample_sleep_duration);
     }
+    // Wait for all samples to be written. If the writer failed, its error is the root cause of a
+    // failed tick, so we report that first.
+    tracker.finish().context(TrackerSnafu)?;
+    tick_result.context(TrackerSnafu)?;
 
     let exit_code = if quit_requested.load(Ordering::Acquire) {
         info!("Termination requested, exiting");

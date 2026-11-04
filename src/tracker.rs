@@ -5,8 +5,9 @@ use log::{trace, warn};
 use py_spy::StackTrace;
 use snafu::{Location, ResultExt, Snafu};
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::collections::hash_map::Entry;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::SystemTime;
 use std::{sync, thread};
@@ -26,6 +27,24 @@ pub enum TrackerError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Error writing samples to `{}` at {location}", path.display()))]
+    WriteSamples {
+        source: std::io::Error,
+        path: PathBuf,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Error serializing sample at {location}"))]
+    SerializeSample {
+        source: serde_json::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("The sample writer thread stopped unexpectedly at {location}"))]
+    WriterGone {
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -41,6 +60,7 @@ pub struct Tracker {
     system: SystemMeasurements,
     output_dir: PathBuf,
     writer_channel: mpsc::SyncSender<WriteRequest>,
+    writer_thread: thread::JoinHandle<Result<(), TrackerError>>,
 }
 
 impl Tracker {
@@ -73,38 +93,14 @@ impl Tracker {
 
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(100);
 
-        thread::spawn(move || {
-            let mut file_lines = HashMap::new();
-
-            while let Ok(req) = rx.recv() {
-                let path = req.output_path;
-                let line_index = file_lines.entry(path.clone()).or_insert(0);
-
-                trace!("Writing stacktraces to {path:?}");
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .unwrap();
-                let line = JsonLine {
-                    stacktraces: req.stacktraces.into_iter().map(|s| s.into()).collect(),
-                    resources: req.resources,
-                    index: *line_index,
-                    time: req.time,
-                };
-                file.write_all(serde_json::to_string(&line).unwrap().as_bytes())
-                    .expect("Write succeeds");
-                file.write_all(b"\n").expect("Write succeeds");
-
-                *line_index += 1;
-            }
-        });
+        let writer_thread = thread::spawn(move || write_samples(rx));
 
         Ok(Self {
             spies: spy_helper,
             system,
             output_dir,
             writer_channel: tx,
+            writer_thread,
         })
     }
 
@@ -112,7 +108,7 @@ impl Tracker {
         self.spies.any_live()
     }
 
-    pub fn tick(&mut self) {
+    pub fn tick(&mut self) -> Result<(), TrackerError> {
         self.system.refresh();
         self.spies.refresh();
 
@@ -129,23 +125,84 @@ impl Tracker {
                 continue;
             };
 
-            self.writer_channel
-                .send(WriteRequest {
-                    output_path: self.output_dir.join(format!("{pid}.json")),
-                    resources: info,
-                    stacktraces: threads.clone(),
-                    time: query_time,
-                })
-                .expect("Send succeeds");
+            self.send(WriteRequest {
+                output_path: self.output_dir.join(format!("{pid}.json")),
+                resources: info,
+                stacktraces: threads,
+                time: query_time,
+            })?;
         }
 
-        self.writer_channel
-            .send(WriteRequest {
-                output_path: self.output_dir.join("global.json"),
-                resources: self.system.get_global_info(),
-                stacktraces: vec![],
-                time: query_time,
-            })
-            .expect("Send succeeds");
+        let global_resources = self.system.get_global_info();
+        self.send(WriteRequest {
+            output_path: self.output_dir.join("global.json"),
+            resources: global_resources,
+            stacktraces: vec![],
+            time: query_time,
+        })
     }
+
+    /// Queues a sample for writing. If this fails, the writer thread has stopped and [`Self::finish`]
+    /// returns the reason.
+    fn send(&self, request: WriteRequest) -> Result<(), TrackerError> {
+        self.writer_channel
+            .send(request)
+            .map_err(|_| WriterGoneSnafu.build())
+    }
+
+    /// Stops the writer thread, waiting until all queued samples are written to disk.
+    pub fn finish(self) -> Result<(), TrackerError> {
+        drop(self.writer_channel);
+        match self.writer_thread.join() {
+            Ok(res) => res,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+}
+
+/// Upper bound for cached file handles, so runs with many short-lived processes do not exhaust the
+/// file descriptor limit
+const MAX_OPEN_FILES: usize = 64;
+
+fn write_samples(rx: mpsc::Receiver<WriteRequest>) -> Result<(), TrackerError> {
+    let mut open_files: HashMap<PathBuf, BufWriter<File>> = HashMap::new();
+    let mut line_indices: HashMap<PathBuf, usize> = HashMap::new();
+
+    while let Ok(req) = rx.recv() {
+        let path = req.output_path;
+        trace!("Writing stacktraces to {path:?}");
+
+        if !open_files.contains_key(&path) && open_files.len() >= MAX_OPEN_FILES {
+            // Every line is flushed after writing, so we can just close all files. Files of
+            // processes that are still alive will be reopened on their next sample.
+            open_files.clear();
+        }
+        let file = match open_files.entry(path.clone()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .context(WriteSamplesSnafu { path: path.clone() })?;
+                entry.insert(BufWriter::new(file))
+            }
+        };
+        let line_index = line_indices.entry(path.clone()).or_insert(0);
+
+        let line = JsonLine {
+            stacktraces: req.stacktraces.into_iter().map(|s| s.into()).collect(),
+            resources: req.resources,
+            index: *line_index,
+            time: req.time,
+        };
+        serde_json::to_writer(&mut *file, &line).context(SerializeSampleSnafu)?;
+        file.write_all(b"\n")
+            .and_then(|_| file.flush())
+            .context(WriteSamplesSnafu { path })?;
+
+        *line_index += 1;
+    }
+
+    Ok(())
 }
