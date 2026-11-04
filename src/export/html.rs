@@ -58,6 +58,9 @@ pub(super) fn export_report(data_dir: &Path, output_file: &Path) -> Result<(), E
 
     for entry in std::fs::read_dir(data_dir).context(OutputDirReadSnafu)? {
         let entry = entry.context(OutputDirReadSnafu)?;
+        if !super::is_report_file(&entry.path()) {
+            continue;
+        }
 
         let name = entry.file_name().to_string_lossy().to_string();
         let content =

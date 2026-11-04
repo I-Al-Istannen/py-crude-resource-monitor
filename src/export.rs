@@ -48,6 +48,9 @@ fn read_report(data_dir: &Path) -> Result<HashMap<ReportIdentifier, Vec<JsonLine
     let mut all_processes = HashMap::new();
     for entry in std::fs::read_dir(data_dir).whatever_context("could not open data dir")? {
         let entry = entry.whatever_context("could not read data dir entry")?;
+        if !is_report_file(&entry.path()) {
+            continue;
+        }
         let name = entry
             .path()
             .file_stem()
@@ -82,4 +85,9 @@ fn read_report(data_dir: &Path) -> Result<HashMap<ReportIdentifier, Vec<JsonLine
     }
 
     Ok(all_processes)
+}
+
+/// Whether the path is one of the sample files written by the profiler.
+fn is_report_file(path: &Path) -> bool {
+    path.is_file() && path.extension().is_some_and(|ext| ext == "json")
 }
