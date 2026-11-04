@@ -15,10 +15,12 @@ pub struct SystemMeasurements {
     refresh_interval: Option<Duration>,
     /// The CPU time in milliseconds each process and thread used until the previous refresh
     previous_cpu_times: HashMap<Pid, u64>,
-    /// The CPU time in milliseconds the main thread of each tracked process used until this and
-    /// the previous refresh. sysinfo does not measure main threads.
-    main_thread_cpu_times: HashMap<Pid, u64>,
-    previous_main_thread_cpu_times: HashMap<Pid, u64>,
+    /// Measures the CPU time of threads, which sysinfo does not do for all threads
+    thread_cpu_reader: ThreadCpuReader,
+    /// The CPU time the threads measured by `thread_cpu_reader` used until this and the previous
+    /// refresh
+    thread_cpu_times: HashMap<u64, Duration>,
+    previous_thread_cpu_times: HashMap<u64, Duration>,
     /// The busy and total time of all cores until this and the previous refresh, see
     /// [`read_cpu_ticks`]
     cpu_ticks: Option<CpuTicks>,
@@ -34,8 +36,9 @@ impl SystemMeasurements {
             last_refresh: None,
             refresh_interval: None,
             previous_cpu_times: HashMap::new(),
-            main_thread_cpu_times: HashMap::new(),
-            previous_main_thread_cpu_times: HashMap::new(),
+            thread_cpu_reader: ThreadCpuReader::default(),
+            thread_cpu_times: HashMap::new(),
+            previous_thread_cpu_times: HashMap::new(),
             cpu_ticks: None,
             previous_cpu_ticks: None,
             record_pss,
@@ -108,7 +111,7 @@ impl SystemMeasurements {
             .iter()
             .map(|(pid, process)| (*pid, process.accumulated_cpu_time()))
             .collect();
-        self.previous_main_thread_cpu_times = std::mem::take(&mut self.main_thread_cpu_times);
+        self.previous_thread_cpu_times = std::mem::take(&mut self.thread_cpu_times);
         self.previous_cpu_ticks = self.cpu_ticks.take();
         self.cpu_ticks = read_cpu_ticks();
 
@@ -127,6 +130,8 @@ impl SystemMeasurements {
         );
         self.disk
             .refresh_specifics(true, DiskRefreshKind::nothing().with_io_usage());
+        self.thread_cpu_reader
+            .retain(|pid| self.system.process(pid).is_some());
     }
 
     /// The CPU usage of a process or thread since the previous refresh, where 100% is one core.
@@ -143,24 +148,34 @@ impl SystemMeasurements {
             Some(previous) if !started_since_last_refresh => *previous,
             _ => 0,
         };
-        self.cpu_percent(process.accumulated_cpu_time().saturating_sub(previous))
+        self.cpu_percent(Duration::from_millis(
+            process.accumulated_cpu_time().saturating_sub(previous),
+        ))
     }
 
-    /// Like [`Self::cpu_usage`], for the main thread of a process
-    fn main_thread_cpu_usage(&mut self, pid: Pid, started_since_last_refresh: bool) -> Option<f32> {
-        let cpu_time = read_main_thread_cpu_time(pid)?;
-        self.main_thread_cpu_times.insert(pid, cpu_time);
-        let previous = match self.previous_main_thread_cpu_times.get(&pid) {
-            Some(previous) if !started_since_last_refresh => *previous,
-            _ => 0,
-        };
-        Some(self.cpu_percent(cpu_time.saturating_sub(previous)))
+    /// Like [`Self::cpu_usage`], for the threads of a process, by thread id
+    fn thread_cpu_usage(
+        &mut self,
+        pid: Pid,
+        started_since_last_refresh: bool,
+    ) -> HashMap<u64, f32> {
+        let mut usage = HashMap::new();
+        for (tid, cpu_time) in self.thread_cpu_reader.read(pid) {
+            self.thread_cpu_times.insert(tid, cpu_time);
+            // Threads we have not seen in the previous refresh started since then
+            let previous = match self.previous_thread_cpu_times.get(&tid) {
+                Some(previous) if !started_since_last_refresh => *previous,
+                _ => Duration::ZERO,
+            };
+            usage.insert(tid, self.cpu_percent(cpu_time.saturating_sub(previous)));
+        }
+        usage
     }
 
-    /// The CPU usage of `used` milliseconds of CPU time since the previous refresh
-    fn cpu_percent(&self, used: u64) -> f32 {
+    /// The CPU usage of `used` CPU time since the previous refresh
+    fn cpu_percent(&self, used: Duration) -> f32 {
         match self.refresh_interval.filter(|it| !it.is_zero()) {
-            Some(interval) => used as f32 / interval.as_secs_f32() / 1000.0 * 100.0,
+            Some(interval) => used.as_secs_f32() / interval.as_secs_f32() * 100.0,
             None => 0.0,
         }
     }
@@ -173,7 +188,7 @@ impl SystemMeasurements {
         let process = self.system.process(pid)?;
 
         let process_cpu = self.cpu_usage(process, started_since_last_refresh);
-        let main_thread_cpu = self.main_thread_cpu_usage(pid, started_since_last_refresh);
+        let measured_thread_cpu = self.thread_cpu_usage(pid, started_since_last_refresh);
         let process = self.system.process(pid)?;
         // Normalize cpu usage to number of cores, as firefox profiler can only render up to 100%
         let cpus = self.system.cpus().len().max(1) as u32;
@@ -190,7 +205,8 @@ impl SystemMeasurements {
                 (
                     task.pid().as_u32() as u64,
                     ThreadResources {
-                        // Threads we have not seen in the previous refresh started since then
+                        // Only used if we cannot measure the thread ourselves. Threads we have not
+                        // seen in the previous refresh started since then.
                         cpu: self.cpu_usage(task, false),
                         memory: task.memory(),
                         disk_read_bytes: task.disk_usage().read_bytes,
@@ -205,11 +221,8 @@ impl SystemMeasurements {
         // short intervals, and flooring it at zero makes idle main threads seem busy.
         if process.tasks().is_some() {
             let others = thread_resources.values();
-            let cpu = main_thread_cpu.unwrap_or_else(|| {
-                (process_cpu - others.clone().map(|it| it.cpu).sum::<f32>()).max(0.0)
-            });
             let main_thread = ThreadResources {
-                cpu,
+                cpu: (process_cpu - others.clone().map(|it| it.cpu).sum::<f32>()).max(0.0),
                 memory,
                 disk_read_bytes: disk_usage
                     .read_bytes
@@ -219,6 +232,18 @@ impl SystemMeasurements {
                     .saturating_sub(others.map(|it| it.disk_write_bytes).sum()),
             };
             thread_resources.insert(pid.as_u32() as u64, main_thread);
+        }
+        // sysinfo does not list threads on macOS, so we only know their CPU usage there
+        for (tid, cpu) in measured_thread_cpu {
+            thread_resources
+                .entry(tid)
+                .and_modify(|it| it.cpu = cpu)
+                .or_insert(ThreadResources {
+                    cpu,
+                    memory,
+                    disk_read_bytes: 0,
+                    disk_write_bytes: 0,
+                });
         }
 
         Some(ProcessResources {
@@ -303,35 +328,63 @@ fn parse_cpu_ticks(stat: &str) -> Option<CpuTicks> {
     })
 }
 
-/// Reads the CPU time in milliseconds the main thread of a process used
-#[cfg(target_os = "linux")]
-fn read_main_thread_cpu_time(pid: Pid) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/stat")).ok()?;
-    parse_cpu_time(&stat)
+/// Reads the CPU time of the threads of a process. sysinfo does not measure the main thread on
+/// Linux and does not list threads at all on macOS. On Linux, it also only updates the time all
+/// cores ran at most every 200ms, which its thread CPU usage is relative to.
+#[derive(Debug, Default)]
+struct ThreadCpuReader {
+    /// The handle of each process, if we could open it. On macOS, that needs root, like py-spy.
+    processes: HashMap<Pid, Option<RemoteProcess>>,
 }
 
-#[cfg(not(target_os = "linux"))]
-fn read_main_thread_cpu_time(_pid: Pid) -> Option<u64> {
-    None
+impl ThreadCpuReader {
+    /// The CPU time each thread used so far, by thread id. Platforms where remoteprocess can not
+    /// measure it return nothing.
+    fn read(&mut self, pid: Pid) -> Vec<(u64, Duration)> {
+        let process = self.processes.entry(pid).or_insert_with(|| {
+            remoteprocess::Process::new(pid.as_u32() as remoteprocess::Pid)
+                .inspect_err(|e| log::debug!("Could not open process {pid}: {e}"))
+                .ok()
+                .map(RemoteProcess)
+        });
+        let Some(RemoteProcess(process)) = process else {
+            return vec![];
+        };
+        let Ok(threads) = process.threads() else {
+            // The process exited, try again if its pid is reused
+            self.processes.remove(&pid);
+            return vec![];
+        };
+        threads
+            .iter()
+            .filter_map(|thread| Some((thread_id(thread)?, thread.cpu_time().ok()??)))
+            .collect()
+    }
+
+    /// Forgets about processes that are not alive anymore
+    fn retain(&mut self, alive: impl Fn(Pid) -> bool) {
+        self.processes.retain(|pid, _| alive(*pid));
+    }
 }
 
-/// Clock ticks per second of the times in `/proc`. Fixed by the kernel ABI, reading it would need
-/// `sysconf` and with it unsafe code.
-const USER_HZ: u64 = 100;
+/// The id py-spy reports for a thread. On macOS, it reads the system-wide id
+/// (`pthread_threadid_np`) from Python's thread states, not the mach port name of the thread.
+#[cfg(target_os = "macos")]
+fn thread_id(thread: &remoteprocess::Thread) -> Option<u64> {
+    Some(thread.get_thread_identifier_info().ok()?.thread_id)
+}
 
-/// Parses the CPU time in milliseconds from a `/proc/<pid>/stat` file
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn parse_cpu_time(stat: &str) -> Option<u64> {
-    // The name in the second field may contain spaces and parentheses, so we split after it. The
-    // first field after it is the third one.
-    let fields = stat
-        .rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .collect::<Vec<_>>();
-    let utime = fields.get(14 - 3)?.parse::<u64>().ok()?;
-    let stime = fields.get(15 - 3)?.parse::<u64>().ok()?;
-    Some((utime + stime) * 1000 / USER_HZ)
+#[cfg(not(target_os = "macos"))]
+fn thread_id(thread: &remoteprocess::Thread) -> Option<u64> {
+    Some(thread.id().ok()? as u64)
+}
+
+struct RemoteProcess(remoteprocess::Process);
+
+impl std::fmt::Debug for RemoteProcess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RemoteProcess").field(&self.0.pid).finish()
+    }
 }
 
 /// Reads the proportional set size of a process. This walks all its pages, so it gets slow for
@@ -386,10 +439,19 @@ Pss_Dirty:        154004 kB
     }
 
     #[test]
-    fn parses_cpu_time_from_stat() {
-        let stat = "42 (a) b) S 1 42 42 0 -1 4194560 3000 0 0 0 250 30 0 0 20 0 4 0 100 0 0";
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn reads_the_cpu_time_of_threads() {
+        let pid = Pid::from_u32(std::process::id());
+        let mut reader = ThreadCpuReader::default();
+        let total = |reader: &mut ThreadCpuReader| -> Duration {
+            reader.read(pid).into_iter().map(|(_, it)| it).sum()
+        };
+        let before = total(&mut reader);
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(100) {
+            std::hint::black_box(());
+        }
 
-        // 250 + 30 clock ticks of 10ms
-        assert_eq!(parse_cpu_time(stat), Some(2800));
+        assert!(total(&mut reader) - before >= Duration::from_millis(50));
     }
 }

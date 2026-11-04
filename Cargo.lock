@@ -1417,6 +1417,7 @@ dependencies = [
  "log",
  "mime_guess",
  "py-spy",
+ "remoteprocess",
  "rust-embed",
  "serde",
  "serde_json",
