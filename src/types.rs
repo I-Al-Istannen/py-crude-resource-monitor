@@ -8,6 +8,9 @@ use std::fmt::Display;
 #[derive(Serialize, Deserialize, Debug)]
 pub struct JsonLine {
     pub stacktraces: Vec<StackTrace>,
+    /// Set if capturing the stacktraces failed for this sample. The resources are still valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stacktrace_error: Option<String>,
     pub resources: ProcessResources,
     pub index: usize,
     pub time: u128,
@@ -171,5 +174,41 @@ impl ValueEnum for NativeCapture {
                 Some(PossibleValue::new("none").help("Do not capture any native stacks."))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_lines_without_stacktrace_error() {
+        // Written by versions before `stacktrace_error` existed
+        let line = r#"{"stacktraces":[],"resources":{"memory":1,"cpu":2.0,"disk_read_bytes":0,"disk_write_bytes":0,"thread_resources":{}},"index":0,"time":1000}"#;
+
+        let line: JsonLine = serde_json::from_str(line).unwrap();
+
+        assert_eq!(line.stacktrace_error, None);
+    }
+
+    #[test]
+    fn omits_missing_stacktrace_error() {
+        let line = JsonLine {
+            stacktraces: vec![],
+            stacktrace_error: None,
+            resources: ProcessResources {
+                memory: 1,
+                cpu: 2.0,
+                disk_read_bytes: 0,
+                disk_write_bytes: 0,
+                thread_resources: HashMap::new(),
+            },
+            index: 0,
+            time: 1000,
+        };
+
+        let json = serde_json::to_string(&line).unwrap();
+
+        assert!(!json.contains("stacktrace_error"));
     }
 }

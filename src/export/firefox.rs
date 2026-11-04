@@ -156,6 +156,10 @@ impl ProfileBuilder {
         let Some(first_sample) = samples.first() else {
             return Ok(());
         };
+        if samples.iter().all(|it| it.stacktraces.is_empty()) {
+            info!("Skipping process {pid}, as no stacktrace could be captured for it");
+            return Ok(());
+        }
         assert!(first_sample.time >= self.start_time_millis);
 
         ProfileBuilderProcess::new(self, first_sample.time, ReportIdentifier::Pid(pid))

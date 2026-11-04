@@ -81,18 +81,17 @@ impl SpyHelper {
         Ok(())
     }
 
-    pub fn get_stacktraces(&mut self) -> HashMap<py_spy::Pid, Vec<StackTrace>> {
+    /// Captures the stacktraces of all tracked processes. A failed capture is returned as an
+    /// error message, so callers can still record the other data for that process.
+    pub fn get_stacktraces(&mut self) -> HashMap<py_spy::Pid, Result<Vec<StackTrace>, String>> {
         let mut all_traces = HashMap::new();
 
         for spy in self.spies.values_mut() {
-            let process_traces = spy.get_stack_traces();
-            if let Err(e) = process_traces {
+            let process_traces = spy.get_stack_traces().map_err(|e| {
                 info!("Sample error {}: {:?}", spy.pid, e);
-                // This might cause null values in the output (i.e. we miss a timestep)!
-                // The viewer must account for that.
-                continue;
-            }
-            all_traces.insert(spy.pid, process_traces.unwrap());
+                format!("{e:#}")
+            });
+            all_traces.insert(spy.pid, process_traces);
         }
 
         all_traces

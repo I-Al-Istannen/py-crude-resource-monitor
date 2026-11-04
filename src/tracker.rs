@@ -52,6 +52,7 @@ struct WriteRequest {
     output_path: PathBuf,
     resources: ProcessResources,
     stacktraces: Vec<StackTrace>,
+    stacktrace_error: Option<String>,
     time: u128,
 }
 
@@ -117,7 +118,7 @@ impl Tracker {
             .unwrap()
             .as_millis();
 
-        for (pid, threads) in self.spies.get_stacktraces() {
+        for (pid, traces) in self.spies.get_stacktraces() {
             let Some(info) = self
                 .system
                 .get_process_info(sysinfo::Pid::from_u32(pid as u32))
@@ -125,10 +126,16 @@ impl Tracker {
                 continue;
             };
 
+            // Record the resources even if the stack capture failed, so the graph has no gaps
+            let (stacktraces, stacktrace_error) = match traces {
+                Ok(traces) => (traces, None),
+                Err(e) => (vec![], Some(e)),
+            };
             self.send(WriteRequest {
                 output_path: self.output_dir.join(format!("{pid}.json")),
                 resources: info,
-                stacktraces: threads,
+                stacktraces,
+                stacktrace_error,
                 time: query_time,
             })?;
         }
@@ -138,6 +145,7 @@ impl Tracker {
             output_path: self.output_dir.join("global.json"),
             resources: global_resources,
             stacktraces: vec![],
+            stacktrace_error: None,
             time: query_time,
         })
     }
@@ -192,6 +200,7 @@ fn write_samples(rx: mpsc::Receiver<WriteRequest>) -> Result<(), TrackerError> {
 
         let line = JsonLine {
             stacktraces: req.stacktraces.into_iter().map(|s| s.into()).collect(),
+            stacktrace_error: req.stacktrace_error,
             resources: req.resources,
             index: *line_index,
             time: req.time,
