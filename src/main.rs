@@ -54,6 +54,9 @@ enum Subcommands {
         /// ms between samples
         #[arg(short, long)]
         sample_rate: Option<u64>,
+        /// Delete samples from a previous run in the output directory without asking
+        #[arg(short, long)]
+        yes: bool,
         #[cfg(feature = "unwind")]
         /// capture native stack traces. If given without a value, defaults to `native-stacks`.
         #[arg(long, default_value_t = NativeCapture::None, default_missing_value = "native-stacks", num_args(0..=1))]
@@ -182,9 +185,10 @@ fn main() -> Result<(), ApplicationError> {
             pid,
             output_dir,
             sample_rate,
+            yes,
             native,
             command,
-        } => run_profile(pid, command, output_dir, sample_rate, native)?,
+        } => run_profile(pid, command, output_dir, sample_rate, yes, native)?,
         Subcommands::View {
             output_dir,
             interface,
@@ -237,6 +241,7 @@ fn run_profile(
     command: Option<Vec<String>>,
     output_dir: PathBuf,
     sample_rate: Option<u64>,
+    skip_confirmation: bool,
     native_capture: NativeCapture,
 ) -> Result<Option<ExitStatus>, ApplicationError> {
     #[cfg(target_os = "macos")]
@@ -259,7 +264,7 @@ fn run_profile(
     let sample_sleep_duration = Duration::from_millis(sample_rate.unwrap_or(1000));
 
     std::fs::create_dir_all(&output_dir).context(DataDirCreateSnafu)?;
-    clear_data_dir(&output_dir)?;
+    clear_data_dir(&output_dir, skip_confirmation)?;
 
     let quit_requested = Arc::new(AtomicBool::new(false));
     let quit_requested_clone = quit_requested.clone();
@@ -388,7 +393,7 @@ fn start_profiling_target(
     Ok((child.id(), Some(KillOnDrop(child))))
 }
 
-fn clear_data_dir(dir: &Path) -> Result<(), ApplicationError> {
+fn clear_data_dir(dir: &Path, skip_confirmation: bool) -> Result<(), ApplicationError> {
     let mut files = Vec::new();
     for file in std::fs::read_dir(dir).context(DataDirClearIoSnafu)? {
         let file = file.context(DataDirClearIoSnafu)?;
@@ -406,16 +411,18 @@ fn clear_data_dir(dir: &Path) -> Result<(), ApplicationError> {
         return Ok(());
     }
 
-    let confirm = Confirm::with_theme(&ColorfulTheme::default())
-        .with_prompt(format!(
-            "Are you sure you want to delete {}?",
-            file_names.join(", ")
-        ))
-        .default(false)
-        .interact()
-        .context(DataDirClearUserSnafu)?;
+    if !skip_confirmation {
+        let confirm = Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt(format!(
+                "Are you sure you want to delete {}?",
+                file_names.join(", ")
+            ))
+            .default(false)
+            .interact()
+            .context(DataDirClearUserSnafu)?;
 
-    ensure!(confirm, DataDirClearCancelSnafu);
+        ensure!(confirm, DataDirClearCancelSnafu);
+    }
 
     for file in files {
         debug!("Removing old file {:?}", file.path());
