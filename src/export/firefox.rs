@@ -67,10 +67,21 @@ struct ProfileBuilder {
     category_python: CategoryHandle,
     include_bandwidth: bool,
     memory: MemoryMetric,
+    /// The main thread of every process in the order they were added, i.e. the global tracks
+    /// first and then by start time
+    main_threads: Vec<ThreadHandle>,
+    /// The summed CPU usage of every other thread, in percent of one core per sample
+    thread_cpu: HashMap<ThreadHandle, f64>,
 }
 
 /// The default interval of `profile`
 const DEFAULT_INTERVAL_MILLIS: u64 = 1000;
+
+/// At most this many main threads are shown by default. Without lanes, every short-lived process
+/// has its own main thread.
+const VISIBLE_MAIN_THREADS: usize = 15;
+/// At most this many threads besides the main threads are shown by default
+const VISIBLE_THREADS: usize = 10;
 
 impl ProfileBuilder {
     pub fn from_samples<'a, T: Iterator<Item = &'a Vec<JsonLine>>>(
@@ -142,6 +153,8 @@ impl ProfileBuilder {
             category_python,
             include_bandwidth,
             memory,
+            main_threads: Vec::new(),
+            thread_cpu: HashMap::new(),
         }
     }
 
@@ -222,7 +235,31 @@ impl ProfileBuilder {
         Ok(())
     }
 
-    pub fn finish(self) -> Profile {
+    /// Without this, the Firefox Profiler shows the 15 busiest threads. Pools with many busy
+    /// threads, like polars', fill all of them and hide the main threads. We show the main threads
+    /// of the processes that started first, which includes the profiled one, and the busiest
+    /// threads.
+    fn set_visible_threads(&mut self) {
+        let mut threads = self.thread_cpu.iter().collect::<Vec<_>>();
+        // Sort by CPU, then by handle so the report is deterministic
+        threads.sort_by(|(a, a_cpu), (b, b_cpu)| b_cpu.total_cmp(a_cpu).then(a.cmp(b)));
+        // Like the Firefox Profiler, hide threads that are idle compared to the busiest one
+        let threshold = threads.first().map_or(0.0, |(_, cpu)| **cpu * 0.05);
+        let busiest = threads
+            .into_iter()
+            .take(VISIBLE_THREADS)
+            .filter(|(_, cpu)| **cpu > threshold)
+            .map(|(thread, _)| *thread)
+            .collect::<Vec<_>>();
+
+        let main_threads = self.main_threads.iter().take(VISIBLE_MAIN_THREADS);
+        for thread in main_threads.chain(&busiest) {
+            self.profile.add_initial_visible_thread(*thread);
+        }
+    }
+
+    pub fn finish(mut self) -> Profile {
+        self.set_visible_threads();
         self.profile
     }
 }
@@ -314,6 +351,7 @@ impl<'a> ProfileBuilderProcess<'a> {
         parent
             .profile
             .set_thread_name(main_thread, MAIN_THREAD_NAME);
+        parent.main_threads.push(main_thread);
         // Otherwise, the Firefox Profiler only shows markers in the tracks of known Firefox threads
         parent
             .profile
@@ -529,19 +567,22 @@ impl<'a> ProfileBuilderProcess<'a> {
                 let thread_resources = stacktrace
                     .os_thread_id
                     .and_then(|id| line.resources.thread_resources.get(&id));
-                let cpu_delta = match thread_resources {
-                    Some(resources) => self.cpu(resources.cpu),
+                let cpu = match thread_resources {
+                    Some(resources) => resources.cpu,
                     // Per-thread data is not available on all platforms, so we attribute the
                     // whole process to the main thread as a fallback. The process CPU is divided
                     // by the number of cores, thread CPU is not.
                     None if thread == self.main_thread
                         && line.resources.thread_resources.is_empty() =>
                     {
-                        let cpus = line.resources.cpus.unwrap_or(1) as f32;
-                        self.cpu(line.resources.cpu * cpus)
+                        line.resources.cpu * line.resources.cpus.unwrap_or(1) as f32
                     }
-                    None => CpuDelta::ZERO,
+                    None => 0.0,
                 };
+                if thread != self.main_thread {
+                    *self.parent.thread_cpu.entry(thread).or_default() += cpu as f64;
+                }
+                let cpu_delta = self.cpu(cpu);
                 self.parent
                     .profile
                     .add_sample(thread, timestamp, stack, cpu_delta, 1);
@@ -872,6 +913,8 @@ fn pack_processes(instances: Vec<Instance>, profile_duration: u128) -> Vec<Vec<I
             lanes[lane].push(instance);
         }
     }
+    // Only the main threads of the first lanes are visible, see `set_visible_threads`
+    lanes.sort_by_key(|lane| (lane[0].start(), lane[0].pid));
 
     lanes
 }
@@ -1545,6 +1588,42 @@ mod tests {
     }
 
     #[test]
+    fn shows_the_main_threads_of_the_processes_that_started_first() {
+        let main = [(1, MAIN_THREAD_NAME)];
+        let mut processes =
+            HashMap::from([(ReportIdentifier::Pid(1), process("root", 1000, 3000, &main))]);
+        // Enough processes running at the same time to fill all visible main threads
+        for pid in 10..10 + VISIBLE_MAIN_THREADS as u32 {
+            processes.insert(
+                ReportIdentifier::Pid(pid),
+                process("early", 1100, 1500, &main),
+            );
+        }
+        // Sorts before the others by name
+        processes.insert(ReportIdentifier::Pid(2), process("a", 2400, 2800, &main));
+        let mut args = args();
+        args.lanes = ProcessLanes::Always;
+
+        let profile = generate_fxprof(processes, &args).unwrap();
+        let json = serde_json::to_value(&profile).unwrap();
+
+        let threads = json["threads"].as_array().unwrap();
+        let visible = json["meta"]["initialVisibleThreads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|index| {
+                threads[index.as_u64().unwrap() as usize]["name"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible.len(), VISIBLE_MAIN_THREADS);
+        assert!(visible.contains(&"root"));
+        assert!(!visible.contains(&"a"));
+    }
+
+    #[test]
     fn packs_threads_with_the_same_name_that_never_overlap() {
         let mut samples = process(
             "python",
@@ -1668,6 +1747,38 @@ mod tests {
                 serde_json::json!(2.0)
             )]
         );
+    }
+
+    #[test]
+    fn shows_main_threads_and_the_busiest_threads_by_default() {
+        // A main thread that waits for 12 busy workers and an idle one
+        let mut threads = vec![stacktrace(1, MAIN_THREAD_NAME), stacktrace(99, "idle")];
+        let mut cpu = vec![(1, 0.0), (99, 0.0)];
+        for id in 2..14 {
+            threads.push(stacktrace(id, &format!("worker-{id}")));
+            cpu.push((id, 50.0 + id as f32));
+        }
+        let samples = (0..3)
+            .map(|i| line(1000 + i * 100, threads.clone(), &cpu))
+            .collect();
+        let json = processes_json(HashMap::from([(ReportIdentifier::Pid(1), samples)]));
+
+        let mut visible = json["meta"]["initialVisibleThreads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|index| {
+                json["threads"][index.as_u64().unwrap() as usize]["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        visible.sort();
+        let mut expected = (4..14).map(|id| format!("worker-{id}")).collect::<Vec<_>>();
+        expected.push("Process".to_string());
+        expected.sort();
+        assert_eq!(visible, expected);
     }
 
     #[test]
