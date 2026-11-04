@@ -1,5 +1,5 @@
 use crate::export::ReportIdentifier;
-use crate::types::JsonLine;
+use crate::types::{JsonLine, ProcessResources};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use fxprof_processed_profile::{
@@ -143,27 +143,29 @@ impl ProfileBuilder {
         let Some(first_sample) = samples.first() else {
             return Ok(());
         };
-        assert!(first_sample.time >= self.start_time_millis);
+        let (start, end) = (first_sample.time, samples.last().unwrap().time);
 
-        ProfileBuilderProcess::new(self, first_sample.time, ReportIdentifier::Global)
-            .add_global(samples)?;
+        let mut process = ProfileBuilderProcess::new(self, "Global", 0, start);
+        // Global CPU is meant to be divided by the number of cores, 100% means all cores are busy
+        process.add_label_samples("Global", samples, |line| line.resources.cpu);
+        process.finish(end);
 
         Ok(())
     }
 
-    fn add_process(&mut self, pid: u32, samples: Vec<JsonLine>) -> Result<(), Whatever> {
-        let Some(first_sample) = samples.first() else {
+    /// Adds processes that ran one after another as a single process to the profile.
+    fn add_lane(&mut self, lane: Vec<Instance>) -> Result<(), Whatever> {
+        let (Some(first), Some(last)) = (lane.first(), lane.last()) else {
             return Ok(());
         };
-        if samples.iter().all(|it| it.stacktraces.is_empty()) {
-            info!("Skipping process {pid}, as no stacktrace could be captured for it");
-            return Ok(());
-        }
-        assert!(first_sample.time >= self.start_time_millis);
+        let (pid, start, end) = (first.pid, first.start(), last.end());
+        let name = first.name().to_string();
 
-        ProfileBuilderProcess::new(self, first_sample.time, ReportIdentifier::Pid(pid))
-            .add_main_thread(&samples)?
-            .add_samples(samples)?;
+        let mut process = ProfileBuilderProcess::new(self, &name, pid, start);
+        for instance in lane {
+            process.add_instance(instance)?;
+        }
+        process.finish(end);
 
         Ok(())
     }
@@ -173,40 +175,82 @@ impl ProfileBuilder {
     }
 }
 
-struct MainThreadAdded {
-    main_thread_handle: ThreadHandle,
+/// One profiled process. The samples of a pid can belong to several processes over time.
+struct Instance {
+    pid: u32,
+    /// Never empty
+    samples: Vec<JsonLine>,
 }
-struct GlobalAdded;
 
-struct ProfileBuilderProcess<'a, T> {
+impl Instance {
+    /// Splits the samples of one pid into the processes that used it.
+    fn split(pid: u32, samples: Vec<JsonLine>) -> Vec<Self> {
+        let mut instances: Vec<Self> = Vec::new();
+        for line in samples {
+            match instances.last_mut() {
+                Some(last)
+                    if last.start_time() == line.process.as_ref().map(|it| it.start_time) =>
+                {
+                    last.samples.push(line)
+                }
+                _ => instances.push(Self {
+                    pid,
+                    samples: vec![line],
+                }),
+            }
+        }
+        instances
+    }
+
+    fn start(&self) -> u128 {
+        self.samples[0].time
+    }
+
+    fn end(&self) -> u128 {
+        self.samples[self.samples.len() - 1].time
+    }
+
+    fn start_time(&self) -> Option<u64> {
+        self.samples[0].process.as_ref().map(|it| it.start_time)
+    }
+
+    fn name(&self) -> &str {
+        self.samples[0]
+            .process
+            .as_ref()
+            .map_or("Process", |it| it.name.as_str())
+    }
+
+    fn has_stacktraces(&self) -> bool {
+        self.samples.iter().any(|it| !it.stacktraces.is_empty())
+    }
+}
+
+/// A process in the Firefox profile
+struct ProfileBuilderProcess<'a> {
     parent: &'a mut ProfileBuilder,
     process: ProcessHandle,
-    pid: u32,
-    start_time_millis: u128,
-    threads: HashMap<u32, ThreadHandle>,
+    main_thread: ThreadHandle,
+    /// All threads except the main thread, by their thread id
+    threads: HashMap<u64, ThreadHandle>,
+    thread_end_times: HashMap<ThreadHandle, Timestamp>,
     memory_counter: ProfileCounter<Initialized>,
     io_counter: Option<ProfileCounter<Initialized>>,
-    data: T,
 }
 
-impl<'a> ProfileBuilderProcess<'a, ()> {
-    pub fn new(
-        parent: &'a mut ProfileBuilder,
-        start_time_millis: u128,
-        identifier: ReportIdentifier,
-    ) -> Self {
-        assert!(start_time_millis >= parent.start_time_millis);
+impl<'a> ProfileBuilderProcess<'a> {
+    pub fn new(parent: &'a mut ProfileBuilder, name: &str, pid: u32, start_millis: u128) -> Self {
+        assert!(start_millis >= parent.start_time_millis);
 
-        let start_timestamp = parent.time(start_time_millis);
-        let (pid, process) = match identifier {
-            ReportIdentifier::Global => {
-                (0, parent.profile.add_process("Global", 0, start_timestamp))
-            }
-            ReportIdentifier::Pid(pid) => (
-                pid,
-                parent.profile.add_process("Process", pid, start_timestamp),
-            ),
-        };
+        let start_timestamp = parent.time(start_millis);
+        let process = parent.profile.add_process(name, pid, start_timestamp);
+        // Adding the main thread first makes the memory track belong to it
+        let main_thread = parent
+            .profile
+            .add_thread(process, pid, start_timestamp, true);
+        parent
+            .profile
+            .set_thread_name(main_thread, MAIN_THREAD_NAME);
 
         // See "renderTrack" for names:
         // https://github.com/firefox-devtools/profiler/blob/main/src/components/timeline/LocalTrack.js#L102
@@ -239,152 +283,14 @@ impl<'a> ProfileBuilderProcess<'a, ()> {
         Self {
             parent,
             process,
-            pid,
-            start_time_millis,
+            main_thread,
             threads: HashMap::new(),
+            thread_end_times: HashMap::new(),
             memory_counter,
             io_counter,
-            data: (),
         }
     }
 
-    fn add_main_thread(
-        mut self,
-        samples: &[JsonLine],
-    ) -> Result<ProfileBuilderProcess<'a, MainThreadAdded>, Whatever> {
-        // adding the main thread first leads to the RAM display corresponding to mainThreadIndex 0 working
-        let mut threads = samples
-            .iter()
-            .flat_map(|it| it.stacktraces.iter())
-            .map(|it| (it.thread_id, it.thread_name.as_deref().unwrap_or("unnamed")))
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        // Ensure the report is deterministic
-        threads.sort_by_key(|(a_id, _)| *a_id);
-
-        let main_thread = threads.iter().find(|(_, name)| *name == MAIN_THREAD_NAME);
-
-        let main_thread_id = match main_thread {
-            Some((thread_id, _)) => *thread_id,
-            None => {
-                let all_threads = threads.iter().map(|(_, name)| *name).collect::<Vec<_>>();
-                info!(
-                    "No main thread found in samples, found threads `{}`.",
-                    all_threads.as_slice().join(", ")
-                );
-                let mut threads_with_py_frame = samples
-                    .iter()
-                    .flat_map(|it| it.stacktraces.iter())
-                    .filter(|it| it.frames.iter().any(|f| !f.is_entry))
-                    .map(|it| (it.thread_id, it.thread_name.as_deref().unwrap_or("unnamed")))
-                    .collect::<Vec<_>>();
-                threads_with_py_frame.dedup();
-
-                let chosen = if !threads_with_py_frame.is_empty() {
-                    info!(
-                        "Choosing from threads with Python frames: `{}`.",
-                        threads_with_py_frame
-                            .iter()
-                            .map(|(_, name)| *name)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                    threads_with_py_frame
-                        .first()
-                        .whatever_context("no threads found")?
-                } else {
-                    threads.first().whatever_context("no threads found")?
-                };
-
-                info!(
-                    "Using first thread `{}` with id `{}` as main thread.",
-                    chosen.1, chosen.0
-                );
-                chosen.0
-            }
-        };
-        let main_thread_handle = self.parent.profile.add_thread(
-            self.process,
-            main_thread_id as u32,
-            self.time(self.start_time_millis),
-            true,
-        );
-        self.parent
-            .profile
-            .set_thread_name(main_thread_handle, MAIN_THREAD_NAME);
-        self.threads
-            .insert(main_thread_id as u32, main_thread_handle);
-
-        Ok(ProfileBuilderProcess {
-            parent: self.parent,
-            process: self.process,
-            pid: self.pid,
-            start_time_millis: self.start_time_millis,
-            threads: self.threads,
-            memory_counter: self.memory_counter,
-            io_counter: self.io_counter,
-            data: MainThreadAdded { main_thread_handle },
-        })
-    }
-
-    pub fn add_global(
-        mut self,
-        samples: Vec<JsonLine>,
-    ) -> Result<ProfileBuilderProcess<'a, GlobalAdded>, Whatever> {
-        let main_thread = self.parent.profile.add_thread(
-            self.process,
-            0,
-            self.time(self.start_time_millis),
-            true,
-        );
-        for line in samples {
-            assert!(line.time >= self.start_time_millis);
-            let timestamp = self.time(line.time);
-
-            self.memory_counter.add_value(
-                &mut self.parent.profile,
-                timestamp,
-                line.resources.memory as f64,
-            );
-            if let Some(io_counter) = self.io_counter.as_mut() {
-                io_counter.add_value(
-                    &mut self.parent.profile,
-                    timestamp,
-                    (line.resources.disk_read_bytes + line.resources.disk_write_bytes) as f64,
-                );
-            }
-
-            let cpu_delta = self.cpu(line.resources.cpu);
-            let frame_label = Frame::Label(self.parent.profile.intern_string("Global"));
-            let stack = self.parent.profile.intern_stack_frames(
-                main_thread,
-                vec![FrameInfo {
-                    frame: frame_label,
-                    category_pair: self.parent.category_native.into(),
-                    flags: FrameFlags::empty(),
-                }]
-                .into_iter(),
-            );
-            self.parent
-                .profile
-                .add_sample(main_thread, timestamp, stack, cpu_delta, 1);
-        }
-
-        Ok(ProfileBuilderProcess {
-            parent: self.parent,
-            process: self.process,
-            pid: self.pid,
-            start_time_millis: self.start_time_millis,
-            threads: HashMap::new(),
-            memory_counter: self.memory_counter,
-            io_counter: self.io_counter,
-            data: GlobalAdded,
-        })
-    }
-}
-
-impl<T> ProfileBuilderProcess<'_, T> {
     fn time(&self, millis: u128) -> Timestamp {
         self.parent.time(millis)
     }
@@ -392,30 +298,80 @@ impl<T> ProfileBuilderProcess<'_, T> {
     fn cpu(&self, percent: f32) -> CpuDelta {
         self.parent.cpu(percent)
     }
-}
 
-impl ProfileBuilderProcess<'_, MainThreadAdded> {
-    pub fn add_samples(mut self, samples: Vec<JsonLine>) -> Result<Self, Whatever> {
+    fn add_instance(&mut self, instance: Instance) -> Result<(), Whatever> {
+        if instance.has_stacktraces() {
+            let main_thread_id = main_thread_id(&instance.samples)?;
+            self.add_stack_samples(instance.samples, main_thread_id);
+        } else {
+            info!(
+                "No stacktraces for process {} ({}), exporting only its resources",
+                instance.pid,
+                instance.name()
+            );
+            let label = instance.name().to_string();
+            // Without threads, all CPU usage belongs to the main thread. Undo the division by the
+            // number of cores, as thread CPU is relative to one core.
+            self.add_label_samples(&label, instance.samples, |line| {
+                line.resources.cpu * line.resources.cpus.unwrap_or(1) as f32
+            });
+        }
+        Ok(())
+    }
+
+    /// Adds samples without stacks, attributing them to a single frame named `label`.
+    fn add_label_samples(
+        &mut self,
+        label: &str,
+        samples: Vec<JsonLine>,
+        cpu: impl Fn(&JsonLine) -> f32,
+    ) {
+        let frame_label = Frame::Label(self.parent.profile.intern_string(label));
+        let stack = self.parent.profile.intern_stack_frames(
+            self.main_thread,
+            [FrameInfo {
+                frame: frame_label,
+                category_pair: self.parent.category_native.into(),
+                flags: FrameFlags::empty(),
+            }]
+            .into_iter(),
+        );
         for line in samples {
-            assert!(line.time >= self.start_time_millis);
+            let timestamp = self.time(line.time);
+            let cpu_delta = self.cpu(cpu(&line));
+            self.parent
+                .profile
+                .add_sample(self.main_thread, timestamp, stack, cpu_delta, 1);
+            self.add_counter_values(timestamp, &line.resources);
+        }
+    }
+
+    fn add_stack_samples(&mut self, samples: Vec<JsonLine>, main_thread_id: u64) {
+        for line in samples {
             let timestamp = self.time(line.time);
 
             for stacktrace in line.stacktraces {
-                let thread_id = stacktrace.thread_id as u32;
-
-                let &mut thread = self.threads.entry(thread_id).or_insert_with(|| {
-                    self.parent
-                        .profile
-                        .add_thread(self.process, thread_id, timestamp, false)
-                });
-
-                // thread name might not be set in first line of the file, so we set it in every
-                // sample we find.
-                if let Some(thread_name) = stacktrace.thread_name {
-                    self.parent
-                        .profile
-                        .set_thread_name(thread, thread_name.as_str());
-                }
+                let thread = if stacktrace.thread_id == main_thread_id {
+                    self.main_thread
+                } else {
+                    let thread = *self.threads.entry(stacktrace.thread_id).or_insert_with(|| {
+                        self.parent.profile.add_thread(
+                            self.process,
+                            stacktrace.thread_id as u32,
+                            timestamp,
+                            false,
+                        )
+                    });
+                    // thread name might not be set in first line of the file, so we set it in
+                    // every sample we find.
+                    if let Some(thread_name) = stacktrace.thread_name {
+                        self.parent
+                            .profile
+                            .set_thread_name(thread, thread_name.as_str());
+                    }
+                    thread
+                };
+                self.thread_end_times.insert(thread, timestamp);
 
                 let mut stack_frames = Vec::with_capacity(stacktrace.frames.len());
                 for frame in stacktrace.frames.iter().rev() {
@@ -455,7 +411,7 @@ impl ProfileBuilderProcess<'_, MainThreadAdded> {
                     // Per-thread data is not available on all platforms, so we attribute the
                     // whole process to the main thread as a fallback. The process CPU is divided
                     // by the number of cores, thread CPU is not.
-                    None if thread == self.data.main_thread_handle
+                    None if thread == self.main_thread
                         && line.resources.thread_resources.is_empty() =>
                     {
                         let cpus = line.resources.cpus.unwrap_or(1) as f32;
@@ -468,22 +424,91 @@ impl ProfileBuilderProcess<'_, MainThreadAdded> {
                     .add_sample(thread, timestamp, stack, cpu_delta, 1);
             }
 
-            self.memory_counter.add_value(
+            self.add_counter_values(timestamp, &line.resources);
+        }
+    }
+
+    fn add_counter_values(&mut self, timestamp: Timestamp, resources: &ProcessResources) {
+        self.memory_counter
+            .add_value(&mut self.parent.profile, timestamp, resources.memory as f64);
+        if let Some(io_counter) = self.io_counter.as_mut() {
+            io_counter.add_value(
                 &mut self.parent.profile,
                 timestamp,
-                line.resources.memory as f64,
+                (resources.disk_read_bytes + resources.disk_write_bytes) as f64,
             );
-            if let Some(io_counter) = self.io_counter.as_mut() {
-                io_counter.add_value(
-                    &mut self.parent.profile,
-                    timestamp,
-                    (line.resources.disk_read_bytes + line.resources.disk_write_bytes) as f64,
-                );
+        }
+    }
+
+    /// Ends the process and all its threads. Threads that were last seen earlier end then.
+    fn finish(self, end_millis: u128) {
+        let end = self.time(end_millis);
+        let profile = &mut self.parent.profile;
+        profile.set_process_end_time(self.process, end);
+        profile.set_thread_end_time(self.main_thread, end);
+        for (thread, end) in self.thread_end_times {
+            if thread != self.main_thread {
+                profile.set_thread_end_time(thread, end);
             }
         }
-
-        Ok(self)
     }
+}
+
+/// Picks the thread of the samples that is shown as the process's main thread
+fn main_thread_id(samples: &[JsonLine]) -> Result<u64, Whatever> {
+    let mut threads = samples
+        .iter()
+        .flat_map(|it| it.stacktraces.iter())
+        .map(|it| (it.thread_id, it.thread_name.as_deref().unwrap_or("unnamed")))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    // Ensure the report is deterministic
+    threads.sort_by_key(|(a_id, _)| *a_id);
+
+    let main_thread = threads.iter().find(|(_, name)| *name == MAIN_THREAD_NAME);
+
+    let main_thread_id = match main_thread {
+        Some((thread_id, _)) => *thread_id,
+        None => {
+            let all_threads = threads.iter().map(|(_, name)| *name).collect::<Vec<_>>();
+            info!(
+                "No main thread found in samples, found threads `{}`.",
+                all_threads.as_slice().join(", ")
+            );
+            let mut threads_with_py_frame = samples
+                .iter()
+                .flat_map(|it| it.stacktraces.iter())
+                .filter(|it| it.frames.iter().any(|f| !f.is_entry))
+                .map(|it| (it.thread_id, it.thread_name.as_deref().unwrap_or("unnamed")))
+                .collect::<Vec<_>>();
+            threads_with_py_frame.dedup();
+
+            let chosen = if !threads_with_py_frame.is_empty() {
+                info!(
+                    "Choosing from threads with Python frames: `{}`.",
+                    threads_with_py_frame
+                        .iter()
+                        .map(|(_, name)| *name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                threads_with_py_frame
+                    .first()
+                    .whatever_context("no threads found")?
+            } else {
+                threads.first().whatever_context("no threads found")?
+            };
+
+            info!(
+                "Using first thread `{}` with id `{}` as main thread.",
+                chosen.1, chosen.0
+            );
+            chosen.0
+        }
+    };
+
+    Ok(main_thread_id)
 }
 
 struct Initialized;
@@ -568,11 +593,18 @@ fn generate_fxprof(
 ) -> Result<Profile, Whatever> {
     let mut builder = ProfileBuilder::from_samples(|| processes.values(), args.bandwidth)?;
 
-    for (pid, samples) in processes {
-        match pid {
-            ReportIdentifier::Pid(pid) => builder.add_process(pid, samples)?,
+    let mut instances = Vec::new();
+    for (identifier, samples) in processes {
+        match identifier {
+            ReportIdentifier::Pid(pid) => instances.extend(Instance::split(pid, samples)),
             ReportIdentifier::Global => builder.add_global(samples)?,
         }
+    }
+    // Ensure the report is deterministic
+    instances.sort_by_key(|it| (it.start(), it.pid));
+
+    for instance in instances {
+        builder.add_lane(vec![instance])?;
     }
 
     Ok(builder.finish())
@@ -600,7 +632,7 @@ fn write_profile(output_path: &Path, profile: Profile) -> Result<(), ExportError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ProcessResources, StackTrace, ThreadResources};
+    use crate::types::{ProcessMetadata, StackTrace, ThreadResources};
 
     fn stacktrace(thread_id: u64, name: &str) -> StackTrace {
         StackTrace {
@@ -676,13 +708,14 @@ mod tests {
     }
 
     #[test]
-    fn exports_threads_and_skips_processes_without_stacktraces() {
+    fn exports_threads_and_processes_without_stacktraces() {
         let threads = || vec![stacktrace(1, MAIN_THREAD_NAME), stacktrace(2, "worker")];
         let python = (0..3)
             .map(|i| line(1000 + i * 100, threads(), &[(1, 80.0), (2, 20.0)]))
             .collect();
         let mut failed_line = line(1000, vec![], &[]);
         failed_line.stacktrace_error = Some("not a python process".to_string());
+        failed_line.process = Some(metadata("yes", 1));
 
         let processes = HashMap::from([
             (ReportIdentifier::Pid(1), python),
@@ -703,9 +736,9 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect::<Vec<_>>();
         thread_names.sort();
-        // Global has one thread, process 1 has two and process 2 is skipped
-        // The main thread of each process is named after the process
-        assert_eq!(thread_names, ["Global", "Process", "worker"]);
+        // Global has one thread, process 1 has two and process 2 one with its resources.
+        // The main thread of each process is named after the process.
+        assert_eq!(thread_names, ["Global", "Process", "worker", "yes"]);
 
         // Each thread gets its own CPU usage, not the one of the whole process (50%)
         let cpu_deltas = |name: &str| {
@@ -725,6 +758,51 @@ mod tests {
         assert_eq!(
             cpu_deltas("worker"),
             serde_json::json!([20000, 20000, 20000])
+        );
+    }
+
+    fn metadata(name: &str, start_time: u64) -> ProcessMetadata {
+        ProcessMetadata {
+            name: name.to_string(),
+            parent_pid: Some(1),
+            start_time,
+        }
+    }
+
+    fn processes_json(processes: HashMap<ReportIdentifier, Vec<JsonLine>>) -> serde_json::Value {
+        serde_json::to_value(generate_fxprof(processes, &args()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn splits_reused_pids_and_ends_processes_at_their_last_sample() {
+        let samples = (0..6)
+            .map(|i| {
+                let mut line = line(1000 + i * 100, vec![], &[]);
+                let (name, start_time) = if i < 3 { ("first", 1) } else { ("second", 2) };
+                line.process = Some(metadata(name, start_time));
+                line
+            })
+            .collect();
+        let json = processes_json(HashMap::from([(ReportIdentifier::Pid(7), samples)]));
+
+        let threads = json["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                (
+                    t["name"].as_str().unwrap().to_string(),
+                    t["registerTime"].as_f64().unwrap(),
+                    t["unregisterTime"].as_f64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            threads,
+            [
+                ("first".to_string(), 0.0, 200.0),
+                ("second".to_string(), 300.0, 500.0)
+            ]
         );
     }
 
