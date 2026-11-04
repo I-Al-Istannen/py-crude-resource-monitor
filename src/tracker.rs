@@ -1,7 +1,10 @@
 use crate::memory_sampler::MemorySampler;
 use crate::resources::SystemMeasurements;
+use crate::samples::{StackTable, write_line};
 use crate::stacktraces::SpyHelper;
-use crate::types::{JsonLine, MemorySample, NativeCapture, ProcessMetadata, ProcessResources};
+use crate::types::{
+    self, JsonLine, MemorySample, NativeCapture, ProcessMetadata, ProcessResources,
+};
 use log::{info, trace};
 use py_spy::StackTrace;
 use snafu::{Location, ResultExt, Snafu};
@@ -232,6 +235,8 @@ const MAX_OPEN_FILES: usize = 64;
 fn write_samples(rx: mpsc::Receiver<WriteRequest>) -> Result<(), TrackerError> {
     let mut open_files: HashMap<PathBuf, BufWriter<File>> = HashMap::new();
     let mut line_indices: HashMap<PathBuf, usize> = HashMap::new();
+    // Kept when closing files, the frames and stacks in them stay valid
+    let mut stack_tables: HashMap<PathBuf, StackTable> = HashMap::new();
 
     while let Ok(req) = rx.recv() {
         let path = req.output_path;
@@ -254,9 +259,16 @@ fn write_samples(rx: mpsc::Receiver<WriteRequest>) -> Result<(), TrackerError> {
             }
         };
         let line_index = line_indices.entry(path.clone()).or_insert(0);
+        let stack_table = stack_tables.entry(path.clone()).or_default();
 
+        let stacktraces = req
+            .stacktraces
+            .into_iter()
+            .map(|trace| stack_table.store(types::StackTrace::from(trace), &mut *file))
+            .collect::<Result<_, _>>()
+            .context(SerializeSampleSnafu)?;
         let line = JsonLine {
-            stacktraces: req.stacktraces.into_iter().map(|s| s.into()).collect(),
+            stacktraces,
             stacktrace_error: req.stacktrace_error,
             resources: req.resources,
             process: req.process,
@@ -264,10 +276,9 @@ fn write_samples(rx: mpsc::Receiver<WriteRequest>) -> Result<(), TrackerError> {
             index: *line_index,
             time: req.time,
         };
-        serde_json::to_writer(&mut *file, &line).context(SerializeSampleSnafu)?;
-        file.write_all(b"\n")
-            .and_then(|_| file.flush())
-            .context(WriteSamplesSnafu { path })?;
+        // The frames and stacks of the sample are flushed with it, so the file is always readable
+        write_line(&mut *file, &line).context(SerializeSampleSnafu)?;
+        file.flush().context(WriteSamplesSnafu { path })?;
 
         *line_index += 1;
     }

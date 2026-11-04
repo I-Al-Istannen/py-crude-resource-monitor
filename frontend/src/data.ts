@@ -12,7 +12,7 @@ export const StackFrameSchema = z.object({
   module: z.string().nullable(),
   short_filename: z.string().nullable(),
   line: z.number(),
-  locals: z.null(), // Only captured when dumping locals, which we never enable
+  locals: z.null().optional(), // Only captured when dumping locals, which we never enable
   is_entry: z.boolean(),
 });
 export type StackFrame = z.infer<typeof StackFrameSchema>;
@@ -24,10 +24,20 @@ export const ThreadDumpSchema = z.object({
   os_thread_id: z.number().nullable(),
   active: z.boolean(),
   owns_gil: z.boolean(),
-  frames: z.array(StackFrameSchema),
-  process_info: z.null(), // Never set by py-spy's PythonSpy, only by its own sampler
+  // The frames, innermost first. Resolved from `stack` while parsing, older reports store them in
+  // every sample.
+  frames: z.array(StackFrameSchema).default([]),
+  // The stack of the thread, see `parseJsonProcessReport`. Missing if it has no frames.
+  stack: z.number().nullish(),
+  process_info: z.null().optional(), // Never set by py-spy's PythonSpy, only by its own sampler
 });
 export type ThreadDump = z.infer<typeof ThreadDumpSchema>;
+
+const StackSchema = z.object({
+  stack: z.number(),
+  parent: z.number().nullable(),
+  frame: z.number(),
+});
 
 export const ProcessReportEntrySchema = z.object({
   stacktraces: z.array(ThreadDumpSchema),
@@ -53,17 +63,57 @@ export type PlotData = {
   yData: (number | null)[][];
 };
 
+/**
+ * Parses a sample file. Frames and stacks are written once, each in their own line before the
+ * first sample using them, and samples reference the stack of every thread by its id:
+ *
+ *   {"frame":0,"name":"<module>","filename":"/w/main.py",...}
+ *   {"stack":0,"parent":null,"frame":0}
+ *   {"stacktraces":[{"thread_id":1,...,"stack":0}],"resources":{...},...}
+ *
+ * A stack is its innermost frame on top of the stack of its caller (`parent`).
+ */
 export function parseJsonProcessReport(
   id: ProcessId,
   reportString: string
 ): ProcessReport {
   const entries = [];
+  const frames: StackFrame[] = [];
+  // The resolved frames of every stack, innermost first
+  const stacks: StackFrame[][] = [];
 
   for (const line of reportString.split("\n")) {
     if (!line) {
       continue;
     }
-    entries.push(ProcessReportEntrySchema.parse(JSON.parse(line)));
+    const json = JSON.parse(line);
+    // Stack lines also have a "frame" key, so check for them first
+    if ("stack" in json) {
+      const stack = StackSchema.parse(json);
+      const callers = stack.parent === null ? [] : stacks[stack.parent];
+      const frame = frames[stack.frame];
+      if (stack.stack !== stacks.length || callers === undefined || frame === undefined) {
+        throw new Error(`Invalid stack in ${id}: ${line}`);
+      }
+      stacks.push([frame, ...callers]);
+    } else if ("frame" in json) {
+      if (json.frame !== frames.length) {
+        throw new Error(`Invalid frame in ${id}: ${line}`);
+      }
+      frames.push(StackFrameSchema.parse(json));
+    } else {
+      const entry = ProcessReportEntrySchema.parse(json);
+      for (const thread of entry.stacktraces) {
+        if (thread.stack != null) {
+          const resolved = stacks[thread.stack];
+          if (resolved === undefined) {
+            throw new Error(`Unknown stack ${thread.stack} in ${id}`);
+          }
+          thread.frames = resolved;
+        }
+      }
+      entries.push(entry);
+    }
   }
 
   return {
