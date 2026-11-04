@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""Runs the stress-test scenarios under the profiler and compares its samples with ground truth.
+
+Each scenario in `scenarios/` records what really happened (see `scenarios/_truth.py`). This script
+profiles it, then evaluates every check the scenario asked for against the recorded samples:
+
+- `pass`/`FAIL`: the profiler should get this right, a failure is a bug or regression
+- `limitation`: a known blind spot of sampling RSS and CPU, reproduced on purpose
+- `info`: a limitation check whose effect did not show up in this run (they are probabilistic)
+
+Only meaningful on Linux, as the ground truth is read from /proc.
+"""
+
+import argparse
+import gzip
+import json
+import os
+import shutil
+import statistics
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SCENARIOS = HERE / "scenarios"
+MiB = 1024 * 1024
+
+PASS, FAIL, LIMITATION, INFO = "pass", "FAIL", "limitation", "info"
+
+
+@dataclass
+class Result:
+    phase: str
+    check: str
+    status: str
+    expected: str
+    measured: str
+
+
+def cpu_count() -> int:
+    # sysinfo counts the CPUs listed in /proc/stat, so we do the same
+    with open("/proc/stat") as f:
+        return sum(1 for line in f if line.startswith("cpu") and line[3].isdigit())
+
+
+def within(measured: float, expected: float, absolute: float, relative: float) -> bool:
+    return abs(measured - expected) <= max(absolute, relative * abs(expected))
+
+
+def mib(value: float) -> str:
+    return f"{value / MiB:.0f} MiB"
+
+
+class Profile:
+    def __init__(self, directory: Path, interval: int, cpus: int, binary: str):
+        self.directory = directory
+        self.interval = interval
+        self.cpus = cpus
+        self.binary = binary
+        self._firefox = None
+        self.processes: dict[int, list[dict]] = {}
+        self.global_samples: list[dict] = []
+        for file in directory.glob("*.json"):
+            samples = [json.loads(line) for line in file.read_text().splitlines() if line]
+            if file.stem == "global":
+                self.global_samples = samples
+            else:
+                self.processes[int(file.stem)] = samples
+
+    def window(self, pid: int, start: float, end: float) -> list[dict]:
+        """Samples whose measurement interval lies completely within [start, end].
+
+        A sample's CPU value covers the interval before it, and the first sample of a process or
+        thread never has one, so we skip the first two intervals.
+        """
+        samples = self.global_samples if pid == "global" else self.processes.get(pid, [])
+        return [s for s in samples if start + 2 * self.interval <= s["time"] <= end]
+
+    def process_cores(self, sample: dict) -> float:
+        # Process CPU is normalized to all cores (100% = every core busy)
+        return sample["resources"]["cpu"] * self.cpus / 100
+
+    @staticmethod
+    def thread_cores(sample: dict, native_id: int) -> float | None:
+        # Thread CPU is *not* normalized (100% = one core busy)
+        thread = sample["resources"]["thread_resources"].get(str(native_id))
+        return None if thread is None else thread["cpu"] / 100
+
+    def firefox_threads(self) -> list[dict]:
+        """Exports the profile in the Firefox Profiler format and returns its threads, with sample
+        times converted to absolute timestamps."""
+        if self._firefox is None:
+            output = self.directory.parent / "firefox.json.gz"
+            subprocess.run(
+                [self.binary, "export", "firefox", str(self.directory), str(output)],
+                check=True,
+                capture_output=True,
+            )
+            self._firefox = json.loads(gzip.decompress(output.read_bytes()))
+            for thread in self._firefox["threads"]:
+                time = self._firefox["meta"]["startTime"]
+                thread["absolute_times"] = []
+                for delta in thread["samples"]["timeDeltas"]:
+                    time += delta
+                    thread["absolute_times"].append(time)
+        return self._firefox["threads"]
+
+    def cpu_seconds(self, samples: list[dict]) -> float:
+        """Integrates the CPU usage of consecutive samples of one process over time."""
+        total = 0.0
+        for previous, current in zip(samples, samples[1:]):
+            total += self.process_cores(current) * (current["time"] - previous["time"]) / 1000
+        return total
+
+
+def has_frame(sample: dict, function: str) -> bool:
+    return any(
+        frame["name"] == function for trace in sample["stacktraces"] for frame in trace["frames"]
+    )
+
+
+def duration_seconds(record: dict) -> float:
+    return (record["end"] - record["start"]) / 1000
+
+
+# Checks. Each one gets the profile, the scenario's ground truth, the phase record and the check
+# definition and returns (status, expected, measured).
+
+
+def check_cpu(profile, truth, phase, check):
+    samples = profile.window(phase["pid"], phase["start"], phase["end"])
+    if not samples:
+        return FAIL, "samples in phase", "none"
+    measured = statistics.mean(profile.process_cores(s) for s in samples)
+    expected = phase["cpu_seconds"] / duration_seconds(phase)
+    status = PASS if within(measured, expected, 0.15, 0.1) else FAIL
+    return status, f"{expected:.2f} cores", f"{measured:.2f} cores ({len(samples)} samples)"
+
+
+def check_thread_cpu(profile, truth, phase, check):
+    expected, measured, status = [], [], PASS
+    for thread in phase["threads"]:
+        if thread["native_id"] == phase["pid"]:
+            # sysinfo does not list the main thread as a task of its process, so there is no data
+            continue
+        samples = profile.window(phase["pid"], thread["start"], thread["end"])
+        values = [v for s in samples if (v := profile.thread_cores(s, thread["native_id"])) is not None]
+        truth_cores = thread["cpu_seconds"] / duration_seconds(thread)
+        expected.append(f"{truth_cores:.2f}")
+        if not values:
+            measured.append("-")
+            status = FAIL
+            continue
+        tool_cores = statistics.mean(values)
+        measured.append(f"{tool_cores:.2f}")
+        if not within(tool_cores, truth_cores, 0.1, 0.1):
+            status = FAIL
+    return status, " / ".join(expected) + " cores", " / ".join(measured) + " cores"
+
+
+def check_firefox_thread_cpu(profile, truth, phase, check):
+    """Per-thread CPU usage as shown by the Firefox Profiler export (`threadCPUDelta`)."""
+    expected, measured, status = [], [], PASS
+    for thread in phase["threads"]:
+        exported = next(
+            t
+            for t in profile.firefox_threads()
+            if t["pid"] == str(phase["pid"])
+            and (t["isMainThread"] if thread["name"] == "MainThread" else t["name"] == thread["name"])
+        )
+        times, deltas = exported["absolute_times"], exported["samples"]["threadCPUDelta"]
+        cores = [
+            # threadCPUDelta is in µs of CPU time since the previous sample
+            delta / 1000 / (time - previous)
+            for previous, time, delta in zip(times, times[1:], deltas[1:])
+            if thread["start"] + 2 * profile.interval <= time <= thread["end"]
+        ]
+        truth_cores = thread["cpu_seconds"] / duration_seconds(thread)
+        tool_cores = statistics.mean(cores) if cores else float("nan")
+        expected.append(f"{truth_cores:.2f}")
+        measured.append(f"{tool_cores:.2f}")
+        if not within(tool_cores, truth_cores, 0.1, 0.1):
+            status = FAIL
+    return status, " / ".join(expected) + " cores", " / ".join(measured) + " cores"
+
+
+def check_stack(profile, truth, phase, check):
+    function, minimum = check["function"], check.get("min_fraction", 0.9)
+    samples = profile.window(phase["pid"], phase["start"], phase["end"])
+    if not samples:
+        return FAIL, f"samples in {function}", "no samples"
+    hits = sum(has_frame(s, function) for s in samples)
+    status = PASS if hits / len(samples) >= minimum else FAIL
+    return (
+        status,
+        f">= {minimum:.0%} of samples in {function}",
+        f"{hits / len(samples):.0%} ({hits}/{len(samples)})",
+    )
+
+
+def check_memory(profile, truth, phase, check):
+    samples = profile.window(phase["pid"], phase["start"], phase["end"])
+    if not samples:
+        return FAIL, "samples in phase", "none"
+    measured = statistics.median(s["resources"]["memory"] for s in samples)
+    expected = phase["rss"]
+    status = PASS if within(measured, expected, 10 * MiB, 0.05) else FAIL
+    return status, f"RSS {mib(expected)}", f"{mib(measured)} ({len(samples)} samples)"
+
+
+def check_growth_attribution(profile, truth, phase, check):
+    """How much of the memory growth happened between samples that show `function` running."""
+    function = check["function"]
+    samples = [
+        s
+        for s in profile.processes.get(phase["pid"], [])
+        if phase["start"] - 1.5 * profile.interval <= s["time"] <= phase["end"] + profile.interval
+    ]
+    growth = attributed = 0
+    for previous, current in zip(samples, samples[1:]):
+        delta = current["resources"]["memory"] - previous["resources"]["memory"]
+        if delta > 0:
+            growth += delta
+            attributed += delta if has_frame(current, function) else 0
+    if growth == 0:
+        return FAIL, f"growth in {function}", "no growth seen"
+    status = PASS if attributed / growth >= 0.9 else FAIL
+    return (
+        status,
+        f">= 90% of growth in {function}",
+        f"{attributed / growth:.0%} of {mib(growth)}",
+    )
+
+
+def check_peak_missed(profile, truth, phase, check):
+    samples = [
+        s
+        for s in profile.processes.get(phase["pid"], [])
+        if phase["start"] <= s["time"] <= phase["end"]
+    ]
+    baseline = phase["baseline_rss"]
+    seen_peak = max(s["resources"]["memory"] for s in samples)
+    true_spike = phase["peak_rss"] - baseline
+    status = LIMITATION if seen_peak - baseline < 0.5 * true_spike else INFO
+    return status, f"peak RSS {mib(phase['peak_rss'])}", f"highest sample {mib(seen_peak)}"
+
+
+def check_shared_overcount(profile, truth, phase, check):
+    graphed = 0
+    for member in phase["members"]:
+        samples = profile.window(member["pid"], phase["start"], phase["end"])
+        if not samples:
+            return FAIL, f"samples for {member['pid']}", "none"
+        graphed += statistics.median(s["resources"]["memory"] for s in samples)
+    footprint = sum(m["pss"] for m in phase["members"])
+    status = LIMITATION if graphed > 1.5 * footprint else INFO
+    return (
+        status,
+        f"real footprint (sum of PSS) {mib(footprint)}",
+        f"sum of all graphs {mib(graphed)} ({graphed / footprint:.1f}x)",
+    )
+
+
+def check_untracked_process(profile, truth, phase, check):
+    cores = phase["child_cpu_seconds"] / duration_seconds(phase)
+    tracked = phase["child_pid"] in profile.processes
+    return (
+        INFO if tracked else LIMITATION,
+        f"child using {cores:.2f} cores",
+        "child profiled" if tracked else "no data for child",
+    )
+
+
+def check_global_cpu_delta(profile, truth, phase, check):
+    baseline_phase = next(p for p in truth["phases"] if p["name"] == check["baseline"])
+
+    def global_cores(record):
+        samples = profile.window("global", record["start"], record["end"])
+        return statistics.mean(profile.process_cores(s) for s in samples)
+
+    measured = global_cores(phase) - global_cores(baseline_phase)
+    expected = phase["child_cpu_seconds"] / duration_seconds(phase)
+    status = PASS if within(measured, expected, 0.3, 0.15) else FAIL
+    return status, f"global +{expected:.2f} cores", f"global +{measured:.2f} cores"
+
+
+def check_child_coverage(profile, truth, phase, check):
+    children = set(phase["child_pids"])
+    seen = children & profile.processes.keys()
+    attributed = sum(
+        profile.cpu_seconds(
+            [s for s in profile.processes[pid] if phase["start"] <= s["time"] <= phase["end"]]
+        )
+        for pid in seen
+    )
+    expected = phase["children_cpu_seconds"]
+    status = LIMITATION if attributed < 0.5 * expected else INFO
+    return (
+        status,
+        f"{len(children)} children, {expected:.2f} CPU-s",
+        f"{len(seen)} seen, {attributed:.2f} CPU-s attributed",
+    )
+
+
+def check_cpu_integral(profile, truth, phase, check):
+    measured = profile.cpu_seconds(profile.processes.get(truth["pid"], []))
+    expected = truth["total_cpu_seconds"]
+    status = PASS if within(measured, expected, 0.25, 0.1) else FAIL
+    return status, f"{expected:.2f} CPU-s", f"{measured:.2f} CPU-s"
+
+
+CHECKS = {
+    "cpu": check_cpu,
+    "thread_cpu": check_thread_cpu,
+    "firefox_thread_cpu": check_firefox_thread_cpu,
+    "stack": check_stack,
+    "memory": check_memory,
+    "growth_attribution": check_growth_attribution,
+    "peak_missed": check_peak_missed,
+    "shared_overcount": check_shared_overcount,
+    "untracked_process": check_untracked_process,
+    "global_cpu_delta": check_global_cpu_delta,
+    "child_coverage": check_child_coverage,
+    "cpu_integral": check_cpu_integral,
+}
+
+
+def run_scenario(name: str, args, cpus: int) -> tuple[str, list[Result]]:
+    output = args.output / name
+    shutil.rmtree(output, ignore_errors=True)
+    output.mkdir(parents=True)
+    profile_dir, truth_file = output / "profile", output / "truth.json"
+
+    command = [
+        args.binary, "profile", "--yes",
+        "--interval", str(args.interval),
+        "--output-dir", str(profile_dir),
+        "--", sys.executable, str(SCENARIOS / f"{name}.py"),
+    ]  # fmt: skip
+    environment = {
+        **os.environ,
+        "STRESS_TRUTH": str(truth_file),
+        "RUST_LOG": "py_crude_resource_monitor=warn",
+    }
+    run = subprocess.run(command, cwd=SCENARIOS, env=environment, capture_output=True, text=True)
+    (output / "profiler.log").write_text(run.stdout + run.stderr)
+    if run.returncode != 0 or not truth_file.exists():
+        failure = Result("-", "run", FAIL, "exit code 0", f"exit code {run.returncode}")
+        return "", [failure]
+
+    subprocess.run(
+        [args.binary, "export", "html", str(profile_dir), str(output / "report.html")],
+        capture_output=True,
+    )
+
+    truth = json.loads(truth_file.read_text())
+    profile = Profile(profile_dir, args.interval, cpus, args.binary)
+    results = []
+    for phase in truth["phases"]:
+        for check in phase["checks"]:
+            status, expected, measured = CHECKS[check["type"]](profile, truth, phase, check)
+            results.append(Result(phase["name"], check["type"], status, expected, measured))
+    for check in truth["checks"]:
+        status, expected, measured = CHECKS[check["type"]](profile, truth, None, check)
+        results.append(Result("whole run", check["type"], status, expected, measured))
+    return truth["description"], results
+
+
+def format_table(results: list[Result]) -> str:
+    rows = [("status", "phase", "check", "ground truth", "profiler")]
+    rows += [(r.status, r.phase, r.check, r.expected, r.measured) for r in results]
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    lines = ["| " + " | ".join(c.ljust(w) for c, w in zip(row, widths)) + " |" for row in rows]
+    lines.insert(1, "|" + "|".join("-" * (w + 2) for w in widths) + "|")
+    return "\n".join(lines)
+
+
+def main():
+    available = sorted(p.stem for p in SCENARIOS.glob("*.py") if not p.name.startswith("_"))
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("scenarios", nargs="*", help=f"default: all of {', '.join(available)}")
+    parser.add_argument("--binary", default="py-crude-resource-monitor")
+    parser.add_argument("--interval", type=int, default=250, help="sampling interval in ms")
+    parser.add_argument("--output", type=Path, default=HERE / "results")
+    args = parser.parse_args()
+    if unknown := set(args.scenarios) - set(available):
+        parser.error(f"unknown scenarios: {', '.join(sorted(unknown))}")
+
+    cpus = cpu_count()
+    summary = [f"# Stress-test results\n\n{cpus} CPUs, sampling every {args.interval} ms\n"]
+    failed = False
+    for name in args.scenarios or available:
+        print(f"Running {name}...", file=sys.stderr, flush=True)
+        description, results = run_scenario(name, args, cpus)
+        failed |= any(r.status == FAIL for r in results)
+        section = f"## {name}\n\n{description.strip()}\n\n{format_table(results)}\n"
+        print(section, flush=True)
+        summary.append(section)
+
+    (args.output / "summary.md").write_text("\n".join(summary))
+    print(f"Profiles, HTML reports and summary.md are in {args.output}", file=sys.stderr)
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()
