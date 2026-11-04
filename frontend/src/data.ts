@@ -21,7 +21,7 @@ export const ThreadDumpSchema = z.object({
   pid: z.number(),
   thread_id: z.number(),
   thread_name: z.string().nullable(),
-  os_thread_id: z.number(),
+  os_thread_id: z.number().nullable(),
   active: z.boolean(),
   owns_gil: z.boolean(),
   frames: z.array(StackFrameSchema),
@@ -31,6 +31,8 @@ export type ThreadDump = z.infer<typeof ThreadDumpSchema>;
 
 export const ProcessReportEntrySchema = z.object({
   stacktraces: z.array(ThreadDumpSchema),
+  // Set if capturing the stacktraces failed for this sample. Missing in older reports.
+  stacktrace_error: z.string().nullish(),
   resources: ProcessResourceSchema,
   index: z.number(),
   time: z.number(),
@@ -74,32 +76,18 @@ export function processReportToSeries(
   report: ProcessReport,
   xAxisTimes: number[]
 ): { cpuValues: (number | null)[]; memoryValues: (number | null)[] } {
-  let memoryValues = [];
-  let cpuValues = [];
-  let currentTimeIndex = 0;
+  const indexByTime = new Map(xAxisTimes.map((time, index) => [time, index]));
+  // Times without a sample (e.g. before the process started) stay null
+  const memoryValues: (number | null)[] = new Array(xAxisTimes.length).fill(null);
+  const cpuValues: (number | null)[] = new Array(xAxisTimes.length).fill(null);
 
-  // Pad with nulls until our time has come
-  while (xAxisTimes[currentTimeIndex] < report.entries[0].time) {
-    memoryValues.push(null);
-    cpuValues.push(null);
-    currentTimeIndex++;
-  }
-  // Copy over the entries
   for (const entry of report.entries) {
-    // If there are any gaps (because sampling failed), we need to fill them with nulls
-    while (entry.time < xAxisTimes[currentTimeIndex]) {
-      memoryValues.push(null);
-      cpuValues.push(null);
-      currentTimeIndex++;
+    const index = indexByTime.get(entry.time);
+    if (index === undefined) {
+      continue;
     }
-
-    memoryValues.push(entry.resources.memory);
-    cpuValues.push(entry.resources.cpu);
-  }
-  // Fill the rest with nulls
-  for (let i = cpuValues.length; i < xAxisTimes.length; i++) {
-    cpuValues.push(null);
-    memoryValues.push(null);
+    memoryValues[index] = entry.resources.memory;
+    cpuValues[index] = entry.resources.cpu;
   }
 
   return {
@@ -110,11 +98,14 @@ export function processReportToSeries(
 
 export function completeReportToSeries(reports: CompleteReport): PlotData {
   const seriesArray = [];
-  const reportArray = [];
   const xAxisTimes = getxAxisTimes(reports);
 
-  for (const report of reports) {
-    reportArray.push(report);
+  // Sort them to allow easy visual binary search in the legend
+  const reportArray = reports
+    .slice()
+    .sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true }));
+
+  for (const report of reportArray) {
     const series = processReportToSeries(report, xAxisTimes);
     seriesArray.push(series.cpuValues);
     seriesArray.push(series.memoryValues);
@@ -130,16 +121,13 @@ export function completeReportToSeries(reports: CompleteReport): PlotData {
 function getxAxisTimes(reports: CompleteReport) {
   const xAxisTimes = new Set<number>();
 
-  for (const report of reports.values()) {
+  for (const report of reports) {
     for (const entry of report.entries) {
       xAxisTimes.add(entry.time);
     }
   }
 
-  const asArray = Array.from(xAxisTimes);
-  asArray.sort();
-
-  return asArray;
+  return Array.from(xAxisTimes).sort((a, b) => a - b);
 }
 
 function baseUrl(): string {

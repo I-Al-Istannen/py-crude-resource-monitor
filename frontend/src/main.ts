@@ -14,11 +14,8 @@ import "./style.css";
   stackTraceArea.textContent = "Fetching report names..."
   const reportNames = await fetchReportNames();
 
-  const reports = [];
-  for (const name of reportNames) {
-    stackTraceArea.textContent += `\nFetching report ${name}`
-    reports.push(await fetchReportByName(name));
-  }
+  stackTraceArea.textContent += `\nFetching ${reportNames.length} reports`
+  const reports = await Promise.all(reportNames.map(fetchReportByName));
 
   stackTraceArea.textContent += "\n\nBuilding Graph series"
   const uplotData = completeReportToSeries(reports as CompleteReport);
