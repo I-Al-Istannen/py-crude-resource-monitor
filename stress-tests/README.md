@@ -22,6 +22,9 @@ Every check has one of these outcomes:
 - `limitation`: a known blind spot of sampling RSS and CPU, reproduced on purpose to document it.
 - `info`: a limitation check whose effect did not show up in this run (some are probabilistic).
 
+CI runs the whole suite on every push and pull request. The results table ends up in the job
+summary, and if the suite fails, the `results/` directory is uploaded as an artifact.
+
 ## Scenarios
 
 | Scenario            | What it shows                                                                                                  |
