@@ -72,6 +72,10 @@ enum Subcommands {
         /// longer the more memory a process uses.
         #[arg(long)]
         pss: bool,
+        /// Write the samples as plain JSON lines instead of compressing them with zstd, e.g. to
+        /// follow them with `tail -f`. They take up several times as much space.
+        #[arg(long)]
+        uncompressed: bool,
         /// Delete samples from a previous run in the output directory without asking
         #[arg(short, long)]
         yes: bool,
@@ -205,6 +209,7 @@ fn main() -> Result<(), ApplicationError> {
             interval,
             memory_interval,
             pss,
+            uncompressed,
             yes,
             native,
             command,
@@ -216,6 +221,7 @@ fn main() -> Result<(), ApplicationError> {
                 interval_millis: interval,
                 memory_interval_millis: memory_interval,
                 record_pss: pss,
+                compress: !uncompressed,
                 native_capture: native,
             },
             yes,
@@ -271,6 +277,7 @@ struct ProfileOptions {
     interval_millis: u64,
     memory_interval_millis: u64,
     record_pss: bool,
+    compress: bool,
     native_capture: NativeCapture,
 }
 
@@ -285,6 +292,7 @@ fn run_profile(
         interval_millis,
         memory_interval_millis,
         record_pss,
+        compress,
         native_capture,
     } = options;
     #[cfg(target_os = "macos")]
@@ -334,6 +342,7 @@ fn run_profile(
         native_capture,
         record_pss,
         memory_interval,
+        compress,
     )
     .context(TrackerSnafu)?;
     info!("Tracking started");
@@ -452,7 +461,8 @@ fn clear_data_dir(dir: &Path, skip_confirmation: bool) -> Result<(), Application
     let mut files = Vec::new();
     for file in std::fs::read_dir(dir).context(DataDirClearIoSnafu)? {
         let file = file.context(DataDirClearIoSnafu)?;
-        if file.file_name().to_string_lossy().ends_with(".json") {
+        let name = file.file_name().to_string_lossy().to_string();
+        if name.ends_with(".json") || name.ends_with(".json.zst") {
             files.push(file);
         }
     }

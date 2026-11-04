@@ -82,11 +82,22 @@ export function parseJsonProcessReport(
   // The resolved frames of every stack, innermost first
   const stacks: StackFrame[][] = [];
 
-  for (const line of reportString.split("\n")) {
+  const lines = reportString.split("\n");
+  for (const [index, line] of lines.entries()) {
     if (!line) {
       continue;
     }
-    const json = JSON.parse(line);
+    let json;
+    try {
+      json = JSON.parse(line);
+    } catch (e) {
+      // The profiler is still writing the last line, or was killed while doing so
+      if (index === lines.length - 1) {
+        console.warn(`Skipping the incomplete last line of ${id}`);
+        break;
+      }
+      throw e;
+    }
     // Stack lines also have a "frame" key, so check for them first
     if ("stack" in json) {
       const stack = StackSchema.parse(json);

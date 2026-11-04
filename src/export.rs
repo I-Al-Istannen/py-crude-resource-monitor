@@ -1,4 +1,4 @@
-use crate::samples::read_samples;
+use crate::samples::{read_sample_file, read_samples, sample_files};
 use crate::types::JsonLine;
 use snafu::{Location, ResultExt, Snafu, Whatever};
 use std::collections::HashMap;
@@ -47,25 +47,11 @@ pub enum ReportIdentifier {
 /// in memory.
 fn read_report(data_dir: &Path) -> Result<HashMap<ReportIdentifier, Vec<JsonLine>>, Whatever> {
     let mut all_processes = HashMap::new();
-    for entry in std::fs::read_dir(data_dir).whatever_context("could not open data dir")? {
-        let entry = entry.whatever_context("could not read data dir entry")?;
-        if !is_report_file(&entry.path()) {
-            continue;
-        }
-        let name = entry
-            .path()
-            .file_stem()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-
-        let content = std::fs::read_to_string(entry.path()).with_whatever_context(|_| {
-            format!("could not read file `{}`", entry.path().display())
-        })?;
-
-        let lines = read_samples(&content).with_whatever_context(|_| {
-            format!("could not deserialize `{}`", entry.path().display())
-        })?;
+    for (name, path) in sample_files(data_dir).whatever_context("could not open data dir")? {
+        let content = read_sample_file(&path)
+            .with_whatever_context(|_| format!("could not read file `{}`", path.display()))?;
+        let lines = read_samples(&content)
+            .with_whatever_context(|_| format!("could not deserialize `{}`", path.display()))?;
 
         let pid = if name == "global" {
             // Pid 1 is the init process, pid 0 is not real and used as a global placeholder.
@@ -81,9 +67,4 @@ fn read_report(data_dir: &Path) -> Result<HashMap<ReportIdentifier, Vec<JsonLine
     }
 
     Ok(all_processes)
-}
-
-/// Whether the path is one of the sample files written by the profiler.
-fn is_report_file(path: &Path) -> bool {
-    path.is_file() && path.extension().is_some_and(|ext| ext == "json")
 }
