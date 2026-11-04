@@ -34,6 +34,9 @@ Results go to `stress-tests/results/`: a summary, raw profiles, ground truth, HT
 | `fork_shared`       | With `--pss`, the total PSS matches the real footprint. *Limitation*: summing the RSS graphs overcounts.        |
 | `exit_race`         | Regression: exiting while being sampled neither hangs the profiler nor loses the exit code.                     |
 
+CI runs the whole suite on every push and pull request. The results table ends up in the job
+summary, and if the suite fails, the `results/` directory is uploaded as an artifact.
+
 ## Findings
 
 [`findings/`](findings/) contains examples of patterns a viewer could detect. These appear as `expected` in the summary until a detector exists; some also run regular profile checks.

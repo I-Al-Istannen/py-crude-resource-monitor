@@ -45,6 +45,26 @@ jobs:
       - name: Test
         run: cargo test --features unwind
 
+  stress-tests:
+    name: Stress Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run stress tests
+        run: ./stress-tests/run.sh
+
+      - name: Add summary
+        if: always()
+        run: cat stress-tests/results/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stress-test-results
+          path: stress-tests/results/
+
   build:
     name: Build Binary (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
