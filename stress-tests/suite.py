@@ -230,21 +230,27 @@ def check_native_stack(profile, truth, phase, check):
 
 def check_native_thread(profile, truth, phase, check):
     """Samples contain a thread without any Python frames that runs code from `library`. py-spy
-    only captures such threads with `--native all`."""
-    library = check["library"]
+    only captures such threads with `--native all`. If given, one of the thread's frames must be
+    named like `function`, which also shows that the name was demangled."""
+    library, function = check["library"], check.get("function", "")
     samples = profile.window(phase["pid"], phase["start"], phase["end"])
     if not samples:
         return FAIL, "samples in phase", "none"
 
     def native_only(trace):
         filenames = [frame["filename"] for frame in trace["frames"]]
-        return not any(f.endswith(".py") for f in filenames) and any(library in f for f in filenames)
+        return (
+            not any(f.endswith(".py") for f in filenames)
+            and any(library in f for f in filenames)
+            and any(function in frame["name"] for frame in trace["frames"])
+        )
 
     hits = sum(any(native_only(t) for t in s["stacktraces"]) for s in samples)
     status = PASS if hits / len(samples) >= 0.9 else FAIL
     return (
         status,
-        f">= 90% of samples with a {library} thread without Python frames",
+        f">= 90% of samples with a {library} thread without Python frames"
+        + (f" in {function}" if function else ""),
         f"{hits / len(samples):.0%} ({hits}/{len(samples)})",
     )
 
