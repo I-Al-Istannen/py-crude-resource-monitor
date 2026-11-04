@@ -1,5 +1,5 @@
 use crate::export::ReportIdentifier;
-use crate::types::{JsonLine, ProcessResources};
+use crate::types::{JsonLine, MemorySample, ProcessResources};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use fxprof_processed_profile::{
@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 const MAIN_THREAD_NAME: &str = "MainThread";
 const CATEGORY_PYTHON_NAME: &str = "Python";
 const CATEGORY_NATIVE_NAME: &str = "Native";
+/// The pid of the track with the total PSS, which is not a real process. The Firefox Profiler
+/// groups tracks by pid, so it must not be the pid of the global track.
+const PSS_TOTAL_PID: u32 = u32::MAX;
 
 #[derive(Debug, Snafu)]
 pub enum ExportError {
@@ -154,7 +157,31 @@ impl ProfileBuilder {
         Ok(())
     }
 
-    /// Adds processes that ran one after another as a single process to the profile.
+    /// Adds a track with the sum of the PSS of all processes over time. Unlike the sum of their
+    /// memory, it counts memory shared between processes only once.
+    fn add_pss_total(&mut self, totals: BTreeMap<u128, u64>) {
+        let (Some((&start, _)), Some((&end, _))) =
+            (totals.first_key_value(), totals.last_key_value())
+        else {
+            return;
+        };
+
+        let mut process = ProfileBuilderProcess::new(
+            self,
+            "All tracked processes (PSS)",
+            PSS_TOTAL_PID,
+            start,
+            false,
+        );
+        for (time, total) in totals {
+            let timestamp = process.time(time);
+            process
+                .memory_counter
+                .add_value(&mut process.parent.profile, timestamp, total as f64);
+        }
+        process.finish(end);
+    }
+
     /// Adds processes that ran one after another as a single process to the profile. With
     /// `pack_threads`, threads are packed into lanes too, see [`ProfileBuilderProcess`].
     fn add_lane(&mut self, lane: Vec<Instance>, pack_threads: bool) -> Result<(), Whatever> {
@@ -367,6 +394,7 @@ impl<'a> ProfileBuilderProcess<'a> {
         );
         for line in samples {
             let timestamp = self.time(line.time);
+            self.add_memory_samples(&line.memory_samples);
             let cpu_delta = self.cpu(cpu(&line));
             self.parent
                 .profile
@@ -415,6 +443,7 @@ impl<'a> ProfileBuilderProcess<'a> {
         let thread_keys = self.thread_keys(&samples, main_thread_id);
         for line in samples {
             let timestamp = self.time(line.time);
+            self.add_memory_samples(&line.memory_samples);
 
             for stacktrace in line.stacktraces {
                 let thread = if stacktrace.thread_id == main_thread_id {
@@ -518,12 +547,25 @@ impl<'a> ProfileBuilderProcess<'a> {
         }
     }
 
+    /// Adds the memory measured between two samples
+    fn add_memory_samples(&mut self, samples: &[MemorySample]) {
+        for sample in samples {
+            let timestamp = self.time(sample.time);
+            self.memory_counter.add_value(
+                &mut self.parent.profile,
+                timestamp,
+                sample.memory as f64,
+            );
+        }
+    }
+
     fn reset_counters(&mut self, millis: u128) {
         let timestamp = self.time(millis);
         self.add_counter_values(
             timestamp,
             &ProcessResources {
                 memory: 0,
+                pss: None,
                 cpu: 0.0,
                 cpus: None,
                 disk_read_bytes: 0,
@@ -826,6 +868,18 @@ fn generate_fxprof(
     let end_millis = processes.values().flatten().map(|it| it.time).max();
     let duration_millis = end_millis.unwrap_or_default() - builder.start_time_millis;
 
+    // Samples of the same tick share their time, so we can add them up by time
+    let mut pss_totals = BTreeMap::<u128, u64>::new();
+    for (identifier, samples) in &processes {
+        if let ReportIdentifier::Pid(_) = identifier {
+            for line in samples {
+                if let Some(pss) = line.resources.pss {
+                    *pss_totals.entry(line.time).or_default() += pss;
+                }
+            }
+        }
+    }
+
     let mut instances = Vec::new();
     for (identifier, samples) in processes {
         match identifier {
@@ -833,6 +887,7 @@ fn generate_fxprof(
             ReportIdentifier::Global => builder.add_global(samples)?,
         }
     }
+    builder.add_pss_total(pss_totals);
     // Ensure the report is deterministic
     instances.sort_by_key(|it| (it.start(), it.pid));
 
@@ -906,8 +961,10 @@ mod tests {
             stacktraces,
             stacktrace_error: None,
             process: None,
+            memory_samples: vec![],
             resources: ProcessResources {
                 memory: 1024,
+                pss: None,
                 cpu: 50.0,
                 cpus: None,
                 disk_read_bytes: 0,
@@ -1005,6 +1062,100 @@ mod tests {
         assert_eq!(
             cpu_deltas("worker"),
             serde_json::json!([20000, 20000, 20000])
+        );
+    }
+
+    /// The memory graph of the process with `pid` as (milliseconds since the start, bytes)
+    fn memory_graph(json: &serde_json::Value, pid: u32) -> Vec<(f64, f64)> {
+        let pid = pid.to_string();
+        let counter = json["counters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["category"] == "Memory" && c["pid"] == pid)
+            .unwrap();
+        let samples = &counter["samples"];
+        let (mut time, mut value) = (0.0, 0.0);
+        let deltas = samples["timeDeltas"].as_array().unwrap();
+        let counts = samples["count"].as_array().unwrap();
+        deltas
+            .iter()
+            .zip(counts)
+            .map(|(delta, count)| {
+                time += delta.as_f64().unwrap();
+                value += count.as_f64().unwrap();
+                (time, value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn adds_memory_samples_between_two_samples_to_the_memory_graph() {
+        let mut second = line(1100, vec![], &[]);
+        second.memory_samples = vec![
+            MemorySample {
+                time: 1040,
+                memory: 1024,
+            },
+            MemorySample {
+                time: 1050,
+                memory: 4096,
+            },
+        ];
+        let samples = vec![line(1000, vec![], &[]), second];
+
+        let json = processes_json(HashMap::from([(ReportIdentifier::Pid(7), samples)]));
+
+        // Starts at zero, then the memory of the first sample, the spike, and the second sample
+        assert_eq!(
+            memory_graph(&json, 7),
+            [
+                (0.0, 0.0),
+                (0.0, 1024.0),
+                (40.0, 1024.0),
+                (50.0, 4096.0),
+                (100.0, 1024.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn adds_a_track_with_the_total_pss() {
+        let process = |pss: &[u64]| {
+            pss.iter()
+                .enumerate()
+                .map(|(i, pss)| {
+                    let mut line = line(1000 + i as u128 * 100, vec![], &[]);
+                    line.resources.pss = Some(*pss);
+                    line
+                })
+                .collect::<Vec<_>>()
+        };
+        let json = processes_json(HashMap::from([
+            (ReportIdentifier::Pid(1), process(&[100, 300])),
+            (ReportIdentifier::Pid(2), process(&[50])),
+        ]));
+
+        assert_eq!(
+            memory_graph(&json, PSS_TOTAL_PID),
+            [(0.0, 0.0), (0.0, 150.0), (100.0, 300.0)]
+        );
+    }
+
+    #[test]
+    fn adds_no_pss_track_without_pss() {
+        let json = processes_json(HashMap::from([(
+            ReportIdentifier::Pid(1),
+            vec![line(1000, vec![], &[]), line(1100, vec![], &[])],
+        )]));
+        let pss_total_pid = PSS_TOTAL_PID.to_string();
+
+        assert!(
+            json["counters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c["pid"] != pss_total_pid)
         );
     }
 

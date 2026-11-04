@@ -1,6 +1,7 @@
+use crate::memory_sampler::MemorySampler;
 use crate::resources::SystemMeasurements;
 use crate::stacktraces::SpyHelper;
-use crate::types::{JsonLine, NativeCapture, ProcessMetadata, ProcessResources};
+use crate::types::{JsonLine, MemorySample, NativeCapture, ProcessMetadata, ProcessResources};
 use log::{info, trace};
 use py_spy::StackTrace;
 use snafu::{Location, ResultExt, Snafu};
@@ -9,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use std::{sync, thread};
 use sync::mpsc;
 
@@ -52,6 +53,7 @@ struct WriteRequest {
     output_path: PathBuf,
     resources: ProcessResources,
     process: Option<ProcessMetadata>,
+    memory_samples: Vec<MemorySample>,
     stacktraces: Vec<StackTrace>,
     stacktrace_error: Option<String>,
     time: u128,
@@ -62,6 +64,7 @@ pub struct Tracker {
     processes: HashMap<sysinfo::Pid, ProcessMetadata>,
     spies: SpyHelper,
     system: SystemMeasurements,
+    memory_sampler: Option<MemorySampler>,
     output_dir: PathBuf,
     writer_channel: mpsc::SyncSender<WriteRequest>,
     writer_thread: thread::JoinHandle<Result<(), TrackerError>>,
@@ -72,13 +75,20 @@ impl Tracker {
         pid: u32,
         output_dir: PathBuf,
         native_capture: NativeCapture,
+        record_pss: bool,
+        memory_interval: Option<Duration>,
     ) -> Result<Self, TrackerError> {
-        let mut system = SystemMeasurements::new().context(SystemMeasurementsSnafu)?;
+        let mut system = SystemMeasurements::new(record_pss).context(SystemMeasurementsSnafu)?;
         system.refresh();
         let processes = system.process_tree([(sysinfo::Pid::from_u32(pid), None)]);
         if processes.is_empty() {
             return ProcessNotFoundSnafu { pid }.fail();
         }
+
+        let memory_sampler = memory_interval
+            .map(MemorySampler::new)
+            .transpose()
+            .context(SystemMeasurementsSnafu)?;
 
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(100);
 
@@ -88,6 +98,7 @@ impl Tracker {
             processes,
             spies: SpyHelper::new(native_capture),
             system,
+            memory_sampler,
             output_dir,
             writer_channel: tx,
             writer_thread,
@@ -101,6 +112,9 @@ impl Tracker {
     pub fn tick(&mut self) -> Result<(), TrackerError> {
         self.system.refresh();
         let new_processes = self.update_processes();
+        if let Some(sampler) = &self.memory_sampler {
+            sampler.set_pids(self.processes.keys().copied());
+        }
 
         let query_time = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -126,10 +140,15 @@ impl Tracker {
                 Ok(traces) => (traces, None),
                 Err(e) => (vec![], Some(e)),
             };
+            let memory_samples = match &self.memory_sampler {
+                Some(sampler) => sampler.take(*pid, query_time),
+                None => vec![],
+            };
             self.send(WriteRequest {
                 output_path: self.output_dir.join(format!("{pid}.json")),
                 resources: info,
                 process: Some(metadata.clone()),
+                memory_samples,
                 stacktraces,
                 stacktrace_error,
                 time: query_time,
@@ -141,6 +160,7 @@ impl Tracker {
             output_path: self.output_dir.join("global.json"),
             resources: global_resources,
             process: None,
+            memory_samples: vec![],
             stacktraces: vec![],
             stacktrace_error: None,
             time: query_time,
@@ -240,6 +260,7 @@ fn write_samples(rx: mpsc::Receiver<WriteRequest>) -> Result<(), TrackerError> {
             stacktrace_error: req.stacktrace_error,
             resources: req.resources,
             process: req.process,
+            memory_samples: req.memory_samples,
             index: *line_index,
             time: req.time,
         };

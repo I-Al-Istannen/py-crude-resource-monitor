@@ -29,7 +29,13 @@ MiB = 1024 * 1024
 PASS, FAIL, LIMITATION, INFO = "pass", "FAIL", "limitation", "info"
 
 # Extra arguments for `profile` per scenario
-PROFILER_ARGS = {"native_stacks": ["--native"], "polars_query": ["--native", "all"]}
+PROFILER_ARGS = {
+    "native_stacks": ["--native"],
+    "polars_query": ["--native", "all"],
+    "fork_shared": ["--pss"],
+}
+# The pid of the Firefox track with the total PSS, which is not a real process
+PSS_TOTAL_PID = 2**32 - 1
 
 
 @dataclass
@@ -90,9 +96,9 @@ class Profile:
         thread = sample["resources"]["thread_resources"].get(str(native_id))
         return None if thread is None else thread["cpu"] / 100
 
-    def firefox_threads(self) -> list[dict]:
-        """Exports the profile in the Firefox Profiler format and returns its threads, with sample
-        times converted to absolute timestamps."""
+    def firefox(self) -> dict:
+        """Exports the profile in the Firefox Profiler format. Sample times of threads are
+        converted to absolute timestamps."""
         if self._firefox is None:
             output = self.directory.parent / "firefox.json.gz"
             subprocess.run(
@@ -107,7 +113,23 @@ class Profile:
                 for delta in thread["samples"]["timeDeltas"]:
                     time += delta
                     thread["absolute_times"].append(time)
-        return self._firefox["threads"]
+        return self._firefox
+
+    def firefox_threads(self) -> list[dict]:
+        return self.firefox()["threads"]
+
+    def firefox_memory(self, pid: int) -> list[tuple[float, float]]:
+        """The memory graph of a process in the Firefox export as (absolute time, bytes)"""
+        firefox = self.firefox()
+        counter = next(
+            c for c in firefox["counters"] if c["category"] == "Memory" and c["pid"] == str(pid)
+        )
+        time, value, graph = firefox["meta"]["startTime"], 0.0, []
+        for delta, count in zip(counter["samples"]["timeDeltas"], counter["samples"]["count"]):
+            time += delta
+            value += count
+            graph.append((time, value))
+        return graph
 
     def cpu_seconds(self, samples: list[dict]) -> float:
         """Integrates the CPU usage of consecutive samples of one process over time. The first
@@ -289,17 +311,66 @@ def check_growth_attribution(profile, truth, phase, check):
     )
 
 
-def check_peak_missed(profile, truth, phase, check):
+def check_memory_peak(profile, truth, phase, check):
+    """The highest memory between the samples, measured by the fast memory sampler"""
     samples = [
         s
         for s in profile.processes.get(phase["pid"], [])
-        if phase["start"] <= s["time"] <= phase["end"]
+        if phase["start"] <= s["time"] <= phase["end"] + profile.interval
     ]
-    baseline = phase["baseline_rss"]
-    seen_peak = max(s["resources"]["memory"] for s in samples)
-    true_spike = phase["peak_rss"] - baseline
-    status = LIMITATION if seen_peak - baseline < 0.5 * true_spike else INFO
-    return status, f"peak RSS {mib(phase['peak_rss'])}", f"highest sample {mib(seen_peak)}"
+    sampled = max(s["resources"]["memory"] for s in samples)
+    in_between = [
+        m["memory"]
+        for s in samples
+        for m in s.get("memory_samples", [])
+        if phase["start"] <= m["time"] <= phase["end"]
+    ]
+    measured, expected = max([sampled, *in_between]), phase["peak_rss"]
+    status = PASS if within(measured, expected, 10 * MiB, 0.05) else FAIL
+    return (
+        status,
+        f"peak RSS {mib(expected)}",
+        f"highest value {mib(measured)} (samples alone: {mib(sampled)})",
+    )
+
+
+def check_firefox_memory_peak(profile, truth, phase, check):
+    """The highest value of the memory graph in the Firefox export"""
+    graph = profile.firefox_memory(phase["pid"])
+    measured = max(v for t, v in graph if phase["start"] <= t <= phase["end"])
+    expected = phase["peak_rss"]
+    status = PASS if within(measured, expected, 10 * MiB, 0.05) else FAIL
+    return status, f"peak RSS {mib(expected)}", f"graph peaks at {mib(measured)}"
+
+
+def check_pss_total(profile, truth, phase, check):
+    """The PSS of all members adds up to their real footprint"""
+    total = 0
+    for member in phase["members"]:
+        samples = profile.window(member["pid"], phase["start"], phase["end"])
+        values = [s["resources"]["pss"] for s in samples if "pss" in s["resources"]]
+        if not values:
+            return FAIL, f"PSS of {member['pid']}", "none"
+        total += statistics.median(values)
+    expected = sum(m["pss"] for m in phase["members"])
+    status = PASS if within(total, expected, 10 * MiB, 0.05) else FAIL
+    return status, f"sum of PSS {mib(expected)}", f"sum of PSS {mib(total)}"
+
+
+def check_firefox_pss_total(profile, truth, phase, check):
+    """The Firefox track with the total PSS shows the real footprint"""
+    graph = profile.firefox_memory(PSS_TOTAL_PID)
+    values = [
+        v
+        for t, v in graph
+        if phase["start"] + 2 * profile.interval <= t <= phase["end"]
+    ]
+    if not values:
+        return FAIL, "PSS track values in phase", "none"
+    measured = statistics.median(values)
+    expected = sum(m["pss"] for m in phase["members"])
+    status = PASS if within(measured, expected, 10 * MiB, 0.05) else FAIL
+    return status, f"sum of PSS {mib(expected)}", f"PSS track {mib(measured)}"
 
 
 def check_shared_overcount(profile, truth, phase, check):
@@ -384,9 +455,9 @@ def check_firefox_cpu_total(profile, truth, phase, check):
     """The Firefox export contains the CPU time of all processes, even if they share tracks."""
     raw = sum(profile.cpu_seconds(samples) for samples in profile.processes.values())
     exported = sum(
-        sum(t["samples"]["threadCPUDelta"]) / 1e6
+        sum(t["samples"].get("threadCPUDelta") or []) / 1e6
         for t in profile.firefox_threads()
-        if t["pid"] != "0"
+        if t["pid"] not in ("0", str(PSS_TOTAL_PID))
     )
     status = PASS if within(exported, raw, 0.5, 0.05) else FAIL
     return status, f"{raw:.2f} CPU-s in the profile", f"{exported:.2f} CPU-s exported"
@@ -408,7 +479,10 @@ CHECKS = {
     "native_thread": check_native_thread,
     "memory": check_memory,
     "growth_attribution": check_growth_attribution,
-    "peak_missed": check_peak_missed,
+    "memory_peak": check_memory_peak,
+    "firefox_memory_peak": check_firefox_memory_peak,
+    "pss_total": check_pss_total,
+    "firefox_pss_total": check_firefox_pss_total,
     "shared_overcount": check_shared_overcount,
     "child_cpu": check_child_cpu,
     "global_cpu_delta": check_global_cpu_delta,

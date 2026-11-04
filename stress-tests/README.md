@@ -39,8 +39,8 @@ summary, and if the suite fails, the `results/` directory is uploaded as an arti
 | `short_lived`       | *Limitation*: children living shorter than a sampling interval get only part of their CPU attributed.         |
 | `memory_steps`      | RSS follows allocations and frees, memory growth is attributed to the function that allocates.                 |
 | `memory_semantics`  | Reserved-but-untouched memory does not count, memory from native `malloc` does (tracemalloc misses it).        |
-| `memory_spike`      | *Limitation*: spikes shorter than the sampling interval are missed.                                            |
-| `fork_shared`       | *Limitation*: copy-on-write pages count for every forked process, so summing the graphs overcounts.            |
+| `memory_spike`      | Spikes shorter than the sampling interval are missed by the samples, but caught by the memory sampler.         |
+| `fork_shared`       | With `--pss`, the total PSS matches the real footprint. *Limitation*: summing the RSS graphs overcounts.        |
 
 ## Adding a scenario
 

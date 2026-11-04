@@ -72,6 +72,13 @@ Options:
   -p, --pid <PID>                The PID of the Python process to monitor
   -o, --output-dir <OUTPUT_DIR>  output directory
   -i, --interval <MS>            Milliseconds between samples [default: 1000]
+      --memory-interval <MS>     Milliseconds between memory measurements taken in between the
+                                 samples, so short allocation spikes are not missed. Only changes
+                                 are stored. 0 disables them [default: 10]
+      --pss                      Also record the proportional set size (PSS) of every process, which
+                                 splits memory shared between processes, e.g. after a fork, between
+                                 them. Linux only. Reading it takes longer the more memory a process
+                                 uses
   -y, --yes                      Delete samples from a previous run in the output directory without
                                  asking
       --native [<NATIVE>]        capture native stack traces. If given without a value, defaults to
