@@ -1,3 +1,4 @@
+use crate::samples::read_samples;
 use crate::types::JsonLine;
 use snafu::{Location, ResultExt, Snafu, Whatever};
 use std::collections::HashMap;
@@ -62,14 +63,9 @@ fn read_report(data_dir: &Path) -> Result<HashMap<ReportIdentifier, Vec<JsonLine
             format!("could not read file `{}`", entry.path().display())
         })?;
 
-        let lines: Vec<JsonLine> = content
-            .lines()
-            .map(|line| {
-                serde_json::from_str(line).with_whatever_context(|_| {
-                    format!("could not deserialize line in `{}`", entry.path().display())
-                })
-            })
-            .collect::<Result<_, _>>()?;
+        let lines = read_samples(&content).with_whatever_context(|_| {
+            format!("could not deserialize `{}`", entry.path().display())
+        })?;
 
         let pid = if name == "global" {
             // Pid 1 is the init process, pid 0 is not real and used as a global placeholder.

@@ -61,6 +61,31 @@ def mib(value: float) -> str:
     return f"{value / MiB:.0f} MiB"
 
 
+def read_samples(file: Path) -> list[dict]:
+    """The samples of a sample file, with the frames of every thread resolved from its stack."""
+    frames: list[dict] = []
+    stacks: list[list[dict]] = []  # the frames of every stack, innermost first
+    samples = []
+    for line in file.read_text().splitlines():
+        if not line:
+            continue
+        data = json.loads(line)
+        # Stack lines also have a "frame" key, so check for them first
+        if "stack" in data:
+            assert data["stack"] == len(stacks), line
+            callers = [] if data["parent"] is None else stacks[data["parent"]]
+            stacks.append([frames[data["frame"]], *callers])
+        elif "frame" in data:
+            assert data["frame"] == len(frames), line
+            frames.append(data)
+        else:
+            for trace in data["stacktraces"]:
+                if trace.get("stack") is not None:
+                    trace["frames"] = stacks[trace["stack"]]
+            samples.append(data)
+    return samples
+
+
 class Profile:
     def __init__(self, directory: Path, interval: int, cpus: int, binary: str):
         self.directory = directory
@@ -71,7 +96,7 @@ class Profile:
         self.processes: dict[int, list[dict]] = {}
         self.global_samples: list[dict] = []
         for file in directory.glob("*.json"):
-            samples = [json.loads(line) for line in file.read_text().splitlines() if line]
+            samples = read_samples(file)
             if file.stem == "global":
                 self.global_samples = samples
             else:

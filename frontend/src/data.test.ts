@@ -108,4 +108,54 @@ describe("parseJsonProcessReport", () => {
     expect(parsed.entries[0].stacktraces[0].os_thread_id).toBeNull();
     expect(parsed.entries[1].stacktrace_error).toBe("process went away");
   });
+
+  test("resolves the stacks of threads", () => {
+    const frame = (frame: number, name: string, line: number) => ({
+      frame,
+      name,
+      filename: "/w/main.py",
+      module: null,
+      short_filename: "main.py",
+      line,
+      is_entry: false,
+    });
+    const thread = (stack: number | null) => ({
+      pid: 1,
+      thread_id: 2,
+      thread_name: "MainThread",
+      os_thread_id: 2,
+      active: true,
+      owns_gil: true,
+      stack,
+    });
+    const sample = (index: number, stacks: (number | null)[]) => ({
+      stacktraces: stacks.map(thread),
+      resources: { memory: 1, cpu: 2 },
+      index,
+      time: 1000 * index,
+    });
+    const lines = [
+      frame(0, "main", 1),
+      { stack: 0, parent: null, frame: 0 },
+      frame(1, "work", 5),
+      { stack: 1, parent: 0, frame: 1 },
+      sample(0, [1, null]),
+      frame(2, "idle", 9),
+      { stack: 2, parent: 0, frame: 2 },
+      sample(1, [2, 1]),
+    ];
+
+    const parsed = parseJsonProcessReport(
+      "1.json",
+      lines.map((it) => JSON.stringify(it)).join("\n")
+    );
+
+    const names = parsed.entries.map((entry) =>
+      entry.stacktraces.map((it) => it.frames.map((f) => `${f.name}:${f.line}`))
+    );
+    expect(names).toEqual([
+      [["work:5", "main:1"], []],
+      [["idle:9", "main:1"], ["work:5", "main:1"]],
+    ]);
+  });
 });
