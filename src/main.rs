@@ -441,13 +441,40 @@ fn run_view(output_dir: PathBuf, interface: &str, port: u16) -> Result<(), Appli
         .context(ViewSnafu)
 }
 
+/// How long a spawned child gets to shut down on its own before we kill it
+const CHILD_GRACE_PERIOD: Duration = Duration::from_secs(5);
+
 struct KillOnDrop(Child);
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        info!("Cleaning up spawned process");
+        // A CTRL+C in the terminal also sends SIGINT to the child and its own children, as they
+        // share our process group. Killing the child right away would prevent it from cleaning up,
+        // e.g. terminating multiprocessing workers, so we give it some time to exit first.
+        let deadline = Instant::now() + CHILD_GRACE_PERIOD;
+        let mut logged = false;
+        while Instant::now() < deadline {
+            match self.0.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {
+                    if !logged {
+                        info!(
+                            "Waiting up to {}s for spawned process to exit",
+                            CHILD_GRACE_PERIOD.as_secs()
+                        );
+                        logged = true;
+                    }
+                    thread::sleep(Duration::from_millis(50))
+                }
+                Err(_) => break,
+            }
+        }
+
+        info!("Killing spawned process");
         if let Err(e) = self.0.kill() {
             warn!("Could not kill spawned child process. It might linger around now. Error: {e}")
         }
+        // Reap the process, so it does not stay around as a zombie
+        let _ = self.0.wait();
     }
 }
