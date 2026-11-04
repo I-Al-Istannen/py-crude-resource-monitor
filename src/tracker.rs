@@ -1,6 +1,6 @@
 use crate::memory_sampler::MemorySampler;
 use crate::resources::SystemMeasurements;
-use crate::samples::{StackTable, write_line};
+use crate::samples::{SampleFile, StackTable, write_line};
 use crate::stacktraces::SpyHelper;
 use crate::types::{
     self, JsonLine, MemorySample, NativeCapture, ProcessMetadata, ProcessResources,
@@ -10,9 +10,7 @@ use py_spy::StackTrace;
 use snafu::{Location, ResultExt, Snafu};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use std::{sync, thread};
 use sync::mpsc;
@@ -53,7 +51,8 @@ pub enum TrackerError {
 
 #[derive(Clone, Debug)]
 struct WriteRequest {
-    output_path: PathBuf,
+    /// The sample file, e.g. `42` or `global`
+    file_name: String,
     resources: ProcessResources,
     process: Option<ProcessMetadata>,
     memory_samples: Vec<MemorySample>,
@@ -68,7 +67,6 @@ pub struct Tracker {
     spies: SpyHelper,
     system: SystemMeasurements,
     memory_sampler: Option<MemorySampler>,
-    output_dir: PathBuf,
     writer_channel: mpsc::SyncSender<WriteRequest>,
     writer_thread: thread::JoinHandle<Result<(), TrackerError>>,
 }
@@ -80,6 +78,7 @@ impl Tracker {
         native_capture: NativeCapture,
         record_pss: bool,
         memory_interval: Option<Duration>,
+        compress: bool,
     ) -> Result<Self, TrackerError> {
         let mut system = SystemMeasurements::new(record_pss).context(SystemMeasurementsSnafu)?;
         system.refresh();
@@ -95,14 +94,13 @@ impl Tracker {
 
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(100);
 
-        let writer_thread = thread::spawn(move || write_samples(rx));
+        let writer_thread = thread::spawn(move || write_samples(rx, output_dir, compress));
 
         Ok(Self {
             processes,
             spies: SpyHelper::new(native_capture),
             system,
             memory_sampler,
-            output_dir,
             writer_channel: tx,
             writer_thread,
         })
@@ -148,7 +146,7 @@ impl Tracker {
                 None => vec![],
             };
             self.send(WriteRequest {
-                output_path: self.output_dir.join(format!("{pid}.json")),
+                file_name: pid.to_string(),
                 resources: info,
                 process: Some(metadata.clone()),
                 memory_samples,
@@ -160,7 +158,7 @@ impl Tracker {
 
         let global_resources = self.system.get_global_info();
         self.send(WriteRequest {
-            output_path: self.output_dir.join("global.json"),
+            file_name: "global".to_string(),
             resources: global_resources,
             process: None,
             memory_samples: vec![],
@@ -232,56 +230,75 @@ impl Tracker {
 /// file descriptor limit
 const MAX_OPEN_FILES: usize = 64;
 
-fn write_samples(rx: mpsc::Receiver<WriteRequest>) -> Result<(), TrackerError> {
-    let mut open_files: HashMap<PathBuf, BufWriter<File>> = HashMap::new();
-    let mut line_indices: HashMap<PathBuf, usize> = HashMap::new();
+fn write_samples(
+    rx: mpsc::Receiver<WriteRequest>,
+    output_dir: PathBuf,
+    compress: bool,
+) -> Result<(), TrackerError> {
+    let mut open_files: HashMap<String, SampleFile> = HashMap::new();
+    let mut line_indices: HashMap<String, usize> = HashMap::new();
     // Kept when closing files, the frames and stacks in them stay valid
-    let mut stack_tables: HashMap<PathBuf, StackTable> = HashMap::new();
+    let mut stack_tables: HashMap<String, StackTable> = HashMap::new();
 
-    while let Ok(req) = rx.recv() {
-        let path = req.output_path;
-        trace!("Writing stacktraces to {path:?}");
+    let result = (|| {
+        while let Ok(req) = rx.recv() {
+            let name = req.file_name;
+            let path = output_dir.join(&name);
+            trace!("Writing stacktraces to {path:?}");
 
-        if !open_files.contains_key(&path) && open_files.len() >= MAX_OPEN_FILES {
-            // Every line is flushed after writing, so we can just close all files. Files of
-            // processes that are still alive will be reopened on their next sample.
-            open_files.clear();
-        }
-        let file = match open_files.entry(path.clone()) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .context(WriteSamplesSnafu { path: path.clone() })?;
-                entry.insert(BufWriter::new(file))
+            if !open_files.contains_key(&name) && open_files.len() >= MAX_OPEN_FILES {
+                // Files of processes that are still alive will be reopened on their next sample
+                close_all(&mut open_files, &output_dir)?;
             }
-        };
-        let line_index = line_indices.entry(path.clone()).or_insert(0);
-        let stack_table = stack_tables.entry(path.clone()).or_default();
+            let file = match open_files.entry(name.clone()) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(
+                    SampleFile::open(&output_dir, &name, compress)
+                        .context(WriteSamplesSnafu { path: path.clone() })?,
+                ),
+            };
+            let line_index = line_indices.entry(name.clone()).or_insert(0);
+            let stack_table = stack_tables.entry(name).or_default();
 
-        let stacktraces = req
-            .stacktraces
-            .into_iter()
-            .map(|trace| stack_table.store(types::StackTrace::from(trace), &mut *file))
-            .collect::<Result<_, _>>()
-            .context(SerializeSampleSnafu)?;
-        let line = JsonLine {
-            stacktraces,
-            stacktrace_error: req.stacktrace_error,
-            resources: req.resources,
-            process: req.process,
-            memory_samples: req.memory_samples,
-            index: *line_index,
-            time: req.time,
-        };
-        // The frames and stacks of the sample are flushed with it, so the file is always readable
-        write_line(&mut *file, &line).context(SerializeSampleSnafu)?;
-        file.flush().context(WriteSamplesSnafu { path })?;
+            let stacktraces = req
+                .stacktraces
+                .into_iter()
+                .map(|trace| stack_table.store(types::StackTrace::from(trace), &mut *file))
+                .collect::<Result<_, _>>()
+                .context(SerializeSampleSnafu)?;
+            let line = JsonLine {
+                stacktraces,
+                stacktrace_error: req.stacktrace_error,
+                resources: req.resources,
+                process: req.process,
+                memory_samples: req.memory_samples,
+                index: *line_index,
+                time: req.time,
+            };
+            // The frames and stacks of the sample are flushed with it, so the file stays readable
+            write_line(&mut *file, &line).context(SerializeSampleSnafu)?;
+            file.flush_lines().context(WriteSamplesSnafu { path })?;
 
-        *line_index += 1;
+            *line_index += 1;
+        }
+        Ok(())
+    })();
+
+    // Also close the files if writing failed, so the samples written so far can be read
+    let closed = close_all(&mut open_files, &output_dir);
+    result.and(closed)
+}
+
+fn close_all(
+    open_files: &mut HashMap<String, SampleFile>,
+    output_dir: &Path,
+) -> Result<(), TrackerError> {
+    let mut result = Ok(());
+    for (name, file) in open_files.drain() {
+        let closed = file.close().context(WriteSamplesSnafu {
+            path: output_dir.join(name),
+        });
+        result = result.and(closed);
     }
-
-    Ok(())
+    result
 }

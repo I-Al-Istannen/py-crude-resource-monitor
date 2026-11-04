@@ -158,4 +158,17 @@ describe("parseJsonProcessReport", () => {
       [["idle:9", "main:1"], ["work:5", "main:1"]],
     ]);
   });
+
+  test("skips an incomplete last line", () => {
+    const sample = JSON.stringify({
+      stacktraces: [],
+      resources: { memory: 1, cpu: 2 },
+      index: 0,
+      time: 1000,
+    });
+
+    const parsed = parseJsonProcessReport("1.json", `${sample}\n${sample.slice(0, 20)}`);
+
+    expect(parsed.entries).toHaveLength(1);
+  });
 });

@@ -22,6 +22,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import zstandard
+
 HERE = Path(__file__).resolve().parent
 SCENARIOS = HERE / "scenarios"
 MiB = 1024 * 1024
@@ -66,7 +68,12 @@ def read_samples(file: Path) -> list[dict]:
     frames: list[dict] = []
     stacks: list[list[dict]] = []  # the frames of every stack, innermost first
     samples = []
-    for line in file.read_text().splitlines():
+    if file.suffix == ".zst":
+        decompressor = zstandard.ZstdDecompressor()
+        content = decompressor.stream_reader(file.read_bytes(), read_across_frames=True).read()
+    else:
+        content = file.read_bytes()
+    for line in content.decode().splitlines():
         if not line:
             continue
         data = json.loads(line)
@@ -95,12 +102,13 @@ class Profile:
         self._firefox: dict[str, dict] = {}
         self.processes: dict[int, list[dict]] = {}
         self.global_samples: list[dict] = []
-        for file in directory.glob("*.json"):
+        for file in [*directory.glob("*.json"), *directory.glob("*.json.zst")]:
             samples = read_samples(file)
-            if file.stem == "global":
+            name = file.name.removesuffix(".zst").removesuffix(".json")
+            if name == "global":
                 self.global_samples = samples
             else:
-                self.processes[int(file.stem)] = samples
+                self.processes[int(name)] = samples
 
     def window(self, pid: int, start: float, end: float) -> list[dict]:
         """Samples whose measurement interval lies completely within [start, end].

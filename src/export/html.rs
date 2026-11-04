@@ -1,3 +1,4 @@
+use crate::samples::{read_sample_file, sample_files};
 use crate::view::Asset;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
@@ -56,18 +57,15 @@ pub enum ExportError {
 pub(super) fn export_report(data_dir: &Path, output_file: &Path) -> Result<(), ExportError> {
     let mut reports = Vec::new();
 
-    for entry in std::fs::read_dir(data_dir).context(OutputDirReadSnafu)? {
-        let entry = entry.context(OutputDirReadSnafu)?;
-        if !super::is_report_file(&entry.path()) {
-            continue;
-        }
-
-        let name = entry.file_name().to_string_lossy().to_string();
-        let content =
-            std::fs::read(entry.path()).context(ReadReportSnafu { name: name.clone() })?;
+    for (name, path) in sample_files(data_dir).context(OutputDirReadSnafu)? {
+        // The frontend gets the files uncompressed, and gzip is all browsers can decompress
+        let content = read_sample_file(&path).context(ReadReportSnafu { name: name.clone() })?;
+        let name = format!("{name}.json");
 
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), Compression::best());
-        encoder.write_all(&content).context(CompressReportSnafu)?;
+        encoder
+            .write_all(content.as_bytes())
+            .context(CompressReportSnafu)?;
         let data = BASE64_STANDARD.encode(encoder.finish().context(CompressReportSnafu)?);
 
         reports.push(json!({

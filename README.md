@@ -79,6 +79,9 @@ Options:
                                  splits memory shared between processes, e.g. after a fork, between
                                  them. Linux only. Reading it takes longer the more memory a process
                                  uses
+      --uncompressed             Write the samples as plain JSON lines instead of compressing them
+                                 with zstd, e.g. to follow them with `tail -f`. They take up several
+                                 times as much space
   -y, --yes                      Delete samples from a previous run in the output directory without
                                  asking
       --native [<NATIVE>]        capture native stack traces. If given without a value, defaults to
