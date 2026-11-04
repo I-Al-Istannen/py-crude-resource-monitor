@@ -1,5 +1,5 @@
 use axum::extract::{Request, State};
-use axum::http::{StatusCode, Uri, header};
+use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -42,12 +42,21 @@ pub async fn run_view(output_dir: PathBuf, interface: &str, port: u16) -> Result
         )
         .route("/", get(|| async { FrontendStaticFile("index.html") }))
         .route("/{*file}", get(serve_frontend))
-        .layer(CorsLayer::very_permissive())
+        // Only the vite dev server needs to access us cross-origin. Allowing any origin would let
+        // every website you visit read your profiles.
+        .layer(CorsLayer::new().allow_origin([
+            HeaderValue::from_static("http://localhost:5173"),
+            HeaderValue::from_static("http://127.0.0.1:5173"),
+        ]))
         .with_state(output_dir);
 
     let listen_address = format!("{interface}:{port}");
     info!("Listening on {listen_address}");
-    info!("This probably resolves to http://localhost:{port}");
+    if interface == "127.0.0.1" || interface == "localhost" {
+        info!("Open http://localhost:{port} to view the profile");
+    } else {
+        info!("This probably resolves to http://localhost:{port}");
+    }
 
     let listener = tokio::net::TcpListener::bind(listen_address.clone())
         .await

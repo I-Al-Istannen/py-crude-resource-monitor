@@ -70,8 +70,9 @@ enum Subcommands {
         /// The port to listen on
         #[arg(long, default_value = "3000")]
         port: u16,
-        /// The interface to listen on
-        #[arg(long, default_value = "0.0.0.0")]
+        /// The interface to listen on. Use `0.0.0.0` to make the viewer reachable from other
+        /// machines.
+        #[arg(long, default_value = "127.0.0.1")]
         interface: String,
     },
     /// Exports a captured profile to a single, shareable HTML file
