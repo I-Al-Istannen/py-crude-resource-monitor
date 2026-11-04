@@ -67,12 +67,16 @@ struct ProfileBuilder {
     category_python: CategoryHandle,
     include_bandwidth: bool,
     memory: MemoryMetric,
-    /// The main thread of every process, shown by default
+    /// The main thread of every process in the order they were added, i.e. the global tracks
+    /// first and then by start time
     main_threads: Vec<ThreadHandle>,
     /// The summed CPU usage of every other thread, in percent of one core per sample
     thread_cpu: HashMap<ThreadHandle, f64>,
 }
 
+/// At most this many main threads are shown by default. Without lanes, every short-lived process
+/// has its own main thread.
+const VISIBLE_MAIN_THREADS: usize = 15;
 /// At most this many threads besides the main threads are shown by default
 const VISIBLE_THREADS: usize = 10;
 
@@ -231,7 +235,9 @@ impl ProfileBuilder {
     }
 
     /// Without this, the Firefox Profiler shows the 15 busiest threads. Pools with many busy
-    /// threads, like polars', fill all of them and hide the main threads.
+    /// threads, like polars', fill all of them and hide the main threads. We show the main threads
+    /// of the processes that started first, which includes the profiled one, and the busiest
+    /// threads.
     fn set_visible_threads(&mut self) {
         let mut threads = self.thread_cpu.iter().collect::<Vec<_>>();
         // Sort by CPU, then by handle so the report is deterministic
@@ -245,7 +251,8 @@ impl ProfileBuilder {
             .map(|(thread, _)| *thread)
             .collect::<Vec<_>>();
 
-        for thread in self.main_threads.iter().chain(&busiest) {
+        let main_threads = self.main_threads.iter().take(VISIBLE_MAIN_THREADS);
+        for thread in main_threads.chain(&busiest) {
             self.profile.add_initial_visible_thread(*thread);
         }
     }
