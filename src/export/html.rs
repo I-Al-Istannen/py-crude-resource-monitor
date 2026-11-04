@@ -80,19 +80,50 @@ pub(super) fn export_report(data_dir: &Path, output_file: &Path) -> Result<(), E
     let report_json = serde_json::to_string(&reports).context(SerializeReportsSnafu)?;
 
     let index_html = Asset::get("index.html").ok_or(IndexNotFoundSnafu.into_error(NoneError))?;
-    let original_html = String::from_utf8_lossy(&index_html.data);
-    let index_html = original_html.replace(
-        "const BUNDLED_REPORTS = []",
-        &format!("const BUNDLED_REPORTS = {report_json};"),
-    );
-
-    if original_html == index_html {
-        return Err(InsertionPointMissingSnafu.into_error(NoneError));
-    }
+    let index_html = inject_reports(&String::from_utf8_lossy(&index_html.data), &report_json)
+        .ok_or(InsertionPointMissingSnafu.into_error(NoneError))?;
 
     std::fs::write(output_file, index_html).context(WriteOutputSnafu {
         path: output_file.display().to_string(),
     })?;
 
     Ok(())
+}
+
+/// Replaces the empty `BUNDLED_REPORTS` array in the frontend with the given reports.
+/// We do not match the `const` keyword, as the bundler might turn it into a `var`.
+fn inject_reports(html: &str, report_json: &str) -> Option<String> {
+    const INSERTION_POINT: &str = "BUNDLED_REPORTS = []";
+    if !html.contains(INSERTION_POINT) {
+        return None;
+    }
+    // Ensure no report content can close the surrounding script tag
+    let report_json = report_json.replace("</", "<\\/");
+    Some(html.replacen(
+        INSERTION_POINT,
+        &format!("BUNDLED_REPORTS = {report_json}"),
+        1,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_frontend_has_insertion_point() {
+        let index_html = Asset::get("index.html").expect("frontend is embedded");
+        let html = String::from_utf8_lossy(&index_html.data);
+
+        let injected = inject_reports(&html, r#"[{"name":"1.json","data":""}]"#).unwrap();
+
+        assert!(injected.contains(r#"BUNDLED_REPORTS = [{"name":"1.json","data":""}]"#));
+    }
+
+    #[test]
+    fn injected_reports_can_not_close_script_tag() {
+        let injected = inject_reports("BUNDLED_REPORTS = []", r#"["</script>"]"#).unwrap();
+
+        assert_eq!(injected, r#"BUNDLED_REPORTS = ["<\/script>"]"#);
+    }
 }
