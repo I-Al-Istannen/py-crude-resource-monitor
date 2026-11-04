@@ -12,7 +12,7 @@ export const StackFrameSchema = z.object({
   module: z.string().nullable(),
   short_filename: z.string().nullable(),
   line: z.number(),
-  locals: z.null(), // TODO: What is this
+  locals: z.null(), // Only captured when dumping locals, which we never enable
   is_entry: z.boolean(),
 });
 export type StackFrame = z.infer<typeof StackFrameSchema>;
@@ -25,7 +25,7 @@ export const ThreadDumpSchema = z.object({
   active: z.boolean(),
   owns_gil: z.boolean(),
   frames: z.array(StackFrameSchema),
-  process_info: z.null(), // TODO: What is this?
+  process_info: z.null(), // Never set by py-spy's PythonSpy, only by its own sampler
 });
 export type ThreadDump = z.infer<typeof ThreadDumpSchema>;
 
