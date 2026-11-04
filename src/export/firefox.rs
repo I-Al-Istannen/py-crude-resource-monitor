@@ -313,6 +313,10 @@ impl<'a> ProfileBuilderProcess<'a> {
         parent
             .profile
             .set_thread_name(main_thread, MAIN_THREAD_NAME);
+        // Otherwise, the Firefox Profiler only shows markers in the tracks of known Firefox threads
+        parent
+            .profile
+            .set_thread_show_markers_in_timeline(main_thread, true);
 
         // See "renderTrack" for names:
         // https://github.com/firefox-devtools/profiler/blob/main/src/components/timeline/LocalTrack.js#L102
