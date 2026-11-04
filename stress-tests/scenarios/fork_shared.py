@@ -1,9 +1,9 @@
-"""Forked workers inherit a large buffer from their parent (copy-on-write).
+"""Forked workers inherit a large buffer from their parent (copy-on-write), profiled with `--pss`.
 
-Shows a limitation: every process reports its RSS, which includes the pages it shares with its
-parent. The per-process numbers are each correct, but adding them up (as you would when eyeballing
-the graph) counts the shared buffer once per process. PSS, which splits shared pages between their
-users, is the actual footprint.
+Shows: every process reports its RSS, which includes the pages it shares with its parent. The
+per-process numbers are each correct, but adding them up (as you would when eyeballing the graph)
+counts the shared buffer once per process (a limitation). PSS, which splits shared pages between
+their users, adds up to the actual footprint, which the export shows as its own track.
 """
 
 import multiprocessing
@@ -56,7 +56,11 @@ truth.add_phase(
         "start": start,
         "end": end,
         "members": members,
-        "checks": [{"type": "shared_overcount"}],
+        "checks": [
+            {"type": "shared_overcount"},
+            {"type": "pss_total"},
+            {"type": "firefox_pss_total"},
+        ],
     }
 )
 

@@ -15,8 +15,19 @@ pub struct JsonLine {
     /// Missing in profiles written by older versions and in the global data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process: Option<ProcessMetadata>,
+    /// Memory measured more often than the samples, between the previous sample and this one.
+    /// Only contains changes, see [`crate::memory_sampler`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_samples: Vec<MemorySample>,
     pub index: usize,
     pub time: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySample {
+    /// Milliseconds since the unix epoch
+    pub time: u128,
+    pub memory: u64,
 }
 
 /// Identifies a process. Pids can be reused, so a file might contain several processes with
@@ -40,6 +51,10 @@ pub struct ThreadResources {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessResources {
     pub memory: u64,
+    /// Proportional set size: like `memory`, but pages shared with other processes are split
+    /// between them. Only recorded on Linux if requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pss: Option<u64>,
     /// Divided by the number of cores, so 100% means all cores are fully used
     pub cpu: f32,
     /// The number of cores `cpu` was divided by. Missing in the global data and in profiles
@@ -215,8 +230,10 @@ mod tests {
             stacktraces: vec![],
             stacktrace_error: None,
             process: None,
+            memory_samples: vec![],
             resources: ProcessResources {
                 memory: 1,
+                pss: None,
                 cpu: 2.0,
                 cpus: None,
                 disk_read_bytes: 0,
