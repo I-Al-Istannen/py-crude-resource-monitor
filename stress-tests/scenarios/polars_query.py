@@ -2,7 +2,7 @@
 
 Shows: the work happens on Rust threads that never run Python code, so py-spy only captures them
 with `--native all`. The process uses several cores while the Python main thread just waits for
-`collect` to return.
+`collect` to return. Polars' Rust function names are demangled.
 """
 
 import polars as pl
@@ -34,7 +34,11 @@ with truth.phase(
     checks=[
         {"type": "cpu"},
         {"type": "stack", "function": "run_query"},
-        {"type": "native_thread", "library": "_polars_runtime"},
+        {
+            "type": "native_thread",
+            "library": "_polars_runtime",
+            "function": "polars_async::executor",
+        },
     ],
 ):
     run_query(5)
