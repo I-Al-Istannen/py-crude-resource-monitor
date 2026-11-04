@@ -67,7 +67,7 @@ class Profile:
         self.interval = interval
         self.cpus = cpus
         self.binary = binary
-        self._firefox = None
+        self._firefox: dict[str, dict] = {}
         self.processes: dict[int, list[dict]] = {}
         self.global_samples: list[dict] = []
         for file in directory.glob("*.json"):
@@ -96,31 +96,33 @@ class Profile:
         thread = sample["resources"]["thread_resources"].get(str(native_id))
         return None if thread is None else thread["cpu"] / 100
 
-    def firefox(self) -> dict:
-        """Exports the profile in the Firefox Profiler format. Sample times of threads are
-        converted to absolute timestamps."""
-        if self._firefox is None:
-            output = self.directory.parent / "firefox.json.gz"
+    def firefox(self, memory: str = "rss") -> dict:
+        """Exports the profile in the Firefox Profiler format, with the memory graphs showing
+        `memory`. Sample times of threads are converted to absolute timestamps."""
+        if memory not in self._firefox:
+            suffix = "" if memory == "rss" else f"-{memory}"
+            output = self.directory.parent / f"firefox{suffix}.json.gz"
             subprocess.run(
-                [self.binary, "export", "firefox", str(self.directory), str(output)],
+                [self.binary, "export", "firefox", "--memory", memory, str(self.directory), str(output)],
                 check=True,
                 capture_output=True,
-            )
-            self._firefox = json.loads(gzip.decompress(output.read_bytes()))
-            for thread in self._firefox["threads"]:
-                time = self._firefox["meta"]["startTime"]
+            )  # fmt: skip
+            firefox = json.loads(gzip.decompress(output.read_bytes()))
+            for thread in firefox["threads"]:
+                time = firefox["meta"]["startTime"]
                 thread["absolute_times"] = []
                 for delta in thread["samples"]["timeDeltas"]:
                     time += delta
                     thread["absolute_times"].append(time)
-        return self._firefox
+            self._firefox[memory] = firefox
+        return self._firefox[memory]
 
     def firefox_threads(self) -> list[dict]:
         return self.firefox()["threads"]
 
-    def firefox_memory(self, pid: int) -> list[tuple[float, float]]:
+    def firefox_memory(self, pid: int, memory: str = "rss") -> list[tuple[float, float]]:
         """The memory graph of a process in the Firefox export as (absolute time, bytes)"""
-        firefox = self.firefox()
+        firefox = self.firefox(memory)
         counter = next(
             c for c in firefox["counters"] if c["category"] == "Memory" and c["pid"] == str(pid)
         )
@@ -358,8 +360,8 @@ def check_pss_total(profile, truth, phase, check):
 
 
 def check_firefox_pss_total(profile, truth, phase, check):
-    """The Firefox track with the total PSS shows the real footprint"""
-    graph = profile.firefox_memory(PSS_TOTAL_PID)
+    """With `--memory pss`, the Firefox track with the total PSS shows the real footprint"""
+    graph = profile.firefox_memory(PSS_TOTAL_PID, memory="pss")
     values = [
         v
         for t, v in graph

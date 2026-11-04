@@ -125,9 +125,11 @@ Arguments:
   <OUTPUT_FILE>  The output file to write the gz-compressed JSON to
 
 Options:
-      --bandwidth      Whether to include bandwidth usage in the export
-      --lanes <LANES>  Whether processes with the same parent and name that never run at the same
-                       time share a track. Recreated worker pools otherwise get a track per process
-                       [default: auto] [possible values: auto, always, never]
-  -h, --help           Print help (see more with '--help')
+      --bandwidth        Whether to include bandwidth usage in the export
+      --lanes <LANES>    Whether processes with the same parent and name that never run at the same
+                         time share a track. Recreated worker pools otherwise get a track per
+                         process [default: auto] [possible values: auto, always, never]
+      --memory <MEMORY>  Which memory the memory graphs show [default: rss] [possible values: rss,
+                         pss]
+  -h, --help             Print help (see more with '--help')
 ```
