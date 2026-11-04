@@ -51,9 +51,16 @@ enum Subcommands {
         /// output directory
         #[arg(short, long)]
         output_dir: PathBuf,
-        /// ms between samples
-        #[arg(short, long)]
-        sample_rate: Option<u64>,
+        /// Milliseconds between samples
+        #[arg(
+            short,
+            long,
+            value_name = "MS",
+            default_value_t = 1000,
+            alias = "sample-rate",
+            short_alias = 's'
+        )]
+        interval: u64,
         /// Delete samples from a previous run in the output directory without asking
         #[arg(short, long)]
         yes: bool,
@@ -184,11 +191,11 @@ fn main() -> Result<(), ApplicationError> {
         Subcommands::Profile {
             pid,
             output_dir,
-            sample_rate,
+            interval,
             yes,
             native,
             command,
-        } => run_profile(pid, command, output_dir, sample_rate, yes, native)?,
+        } => run_profile(pid, command, output_dir, interval, yes, native)?,
         Subcommands::View {
             output_dir,
             interface,
@@ -240,7 +247,7 @@ fn run_profile(
     pid: Option<u32>,
     command: Option<Vec<String>>,
     output_dir: PathBuf,
-    sample_rate: Option<u64>,
+    interval_millis: u64,
     skip_confirmation: bool,
     native_capture: NativeCapture,
 ) -> Result<Option<ExitStatus>, ApplicationError> {
@@ -261,7 +268,7 @@ fn run_profile(
         return Err(MissingUnwindSupportSnafu.into_error(NoneError));
     }
 
-    let sample_sleep_duration = Duration::from_millis(sample_rate.unwrap_or(1000));
+    let sample_sleep_duration = Duration::from_millis(interval_millis);
 
     std::fs::create_dir_all(&output_dir).context(DataDirCreateSnafu)?;
     clear_data_dir(&output_dir, skip_confirmation)?;
