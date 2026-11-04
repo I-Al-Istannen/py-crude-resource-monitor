@@ -11,7 +11,7 @@ function displayStackframePlugin(plotData: PlotData): uPlot.Plugin {
     const traceArea = document.getElementById("stacktraceArea")!;
 
     if (dataIdx === null || seriesIdx === null) {
-      traceArea.innerHTML = "";
+      traceArea.replaceChildren();
       return;
     }
     // -1 for x?
@@ -24,27 +24,35 @@ function displayStackframePlugin(plotData: PlotData): uPlot.Plugin {
       (it) => it.time
     );
     if (index < 0) {
+      // This process has no sample at the hovered time
+      traceArea.replaceChildren();
       return;
     }
-    // Sort them by ID to have the main thread appear first
-    const threads = report.entries[index].stacktraces.slice();
-    threads.sort((a, b) => b.thread_id - a.thread_id);
+    const entry = report.entries[index];
+    traceArea.replaceChildren();
 
-    let content = "";
-    for (const thread of threads) {
-      content += `<h3>${thread.os_thread_id} (${thread.thread_name})</h3>`;
-      content += `<div class="frames">`;
-      let frames = "";
-      for (const frame of thread.frames) {
-        frames += `${frame.name} (${frame.short_filename}:${frame.line})\n`;
-      }
-      const span = document.createElement("span");
-      span.textContent = frames;
-      content += span.innerHTML;
-      content += "</div>";
+    if (entry.stacktrace_error) {
+      const error = document.createElement("p");
+      error.textContent = `Capturing stacktraces failed: ${entry.stacktrace_error}`;
+      traceArea.append(error);
     }
 
-    traceArea.innerHTML = content;
+    // Sort them by ID to have the main thread appear first
+    const threads = entry.stacktraces.slice();
+    threads.sort((a, b) => b.thread_id - a.thread_id);
+
+    for (const thread of threads) {
+      const heading = document.createElement("h3");
+      heading.textContent = `${thread.os_thread_id ?? thread.thread_id} (${thread.thread_name})`;
+
+      const frames = document.createElement("div");
+      frames.className = "frames";
+      frames.textContent = thread.frames
+        .map((frame) => `${frame.name} (${frame.short_filename}:${frame.line})\n`)
+        .join("");
+
+      traceArea.append(heading, frames);
+    }
   }
 
   return {
@@ -52,7 +60,7 @@ function displayStackframePlugin(plotData: PlotData): uPlot.Plugin {
       setCursor: (u) => {
         const idx = u.cursor.idx;
         if (idx !== dataIdx) {
-          dataIdx = idx || null;
+          dataIdx = idx ?? null;
           updateDisplay();
         }
       },
@@ -145,10 +153,6 @@ function buildPlotOptions(plotData: PlotData, colors: string[]): uPlot.Options {
     },
     plugins: [displayStackframePlugin(plotData)],
   };
-
-  const reports = plotData.reports.slice();
-  // Sort them to allow easy visual binary search
-  reports.sort((a, b) => a.id.localeCompare(b.id));
 
   let counter = 0;
   for (const report of plotData.reports) {
