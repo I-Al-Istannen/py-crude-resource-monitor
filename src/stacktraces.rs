@@ -1,8 +1,12 @@
 use crate::types::NativeCapture;
-use log::{debug, info};
+use log::{debug, info, warn};
 use py_spy::{Config, PythonSpy, StackTrace};
 use snafu::{Location, ResultExt, Snafu};
 use std::collections::HashMap;
+
+/// How often we try to attach to a child process before giving up on it. Freshly spawned Python
+/// processes might not have initialized their interpreter yet, so the first attempts can fail.
+const MAX_ATTACH_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Snafu)]
 pub enum PySpyError {
@@ -16,6 +20,8 @@ pub enum PySpyError {
 
 pub struct SpyHelper {
     spies: HashMap<py_spy::Pid, PythonSpy>,
+    /// Child processes we could not attach to, with the number of failed attempts
+    failed_attaches: HashMap<py_spy::Pid, u32>,
     py_spy_config: Config,
 }
 
@@ -23,6 +29,7 @@ impl SpyHelper {
     pub fn new(root: py_spy::Pid, native_capture: NativeCapture) -> Result<Self, PySpyError> {
         let mut helper = Self {
             spies: HashMap::new(),
+            failed_attaches: HashMap::new(),
             py_spy_config: Config {
                 native: native_capture.python_stacks(),
                 native_all: native_capture.everything(),
@@ -48,6 +55,10 @@ impl SpyHelper {
                     if self.spies.contains_key(&child) {
                         continue;
                     }
+                    let attempts = self.failed_attaches.get(&child).copied().unwrap_or(0);
+                    if attempts >= MAX_ATTACH_ATTEMPTS {
+                        continue;
+                    }
                     new_processes.push(child);
                 }
             }
@@ -63,11 +74,27 @@ impl SpyHelper {
         }
 
         // Add new processes
+        new_processes.sort_unstable();
+        new_processes.dedup();
         for pid in new_processes {
-            if let Err(e) = self.track_process(pid) {
-                info!("Error tracking process {pid}: {e}");
+            match self.track_process(pid) {
+                Ok(()) => {
+                    self.failed_attaches.remove(&pid);
+                    info!("Tracking new process {pid}");
+                }
+                Err(e) => {
+                    let attempts = self.failed_attaches.entry(pid).or_insert(0);
+                    *attempts += 1;
+                    if *attempts >= MAX_ATTACH_ATTEMPTS {
+                        warn!(
+                            "Giving up on process {pid} after {attempts} attempts, \
+                            it is probably not a Python process: {e}"
+                        );
+                    } else {
+                        debug!("Error tracking process {pid} (attempt {attempts}): {e}");
+                    }
+                }
             }
-            info!("Tracking new process {pid}");
         }
 
         debug!("Tracking {} processes", self.spies.len());
