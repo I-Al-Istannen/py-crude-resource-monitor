@@ -30,6 +30,7 @@ Every check has one of these outcomes:
 | `gil_threads`       | Four GIL-bound threads share one core, four GIL-releasing threads use four. Per-thread CPU makes this visible. |
 | `pool_cpu`          | Pool workers are discovered and accounted separately, the parent is idle in `Pool.map`.                        |
 | `child_processes`   | Python grandchildren behind a shell are profiled, non-Python children get resources without stacks.           |
+| `pool_churn`        | A pool recreated 30 times fills as many Firefox tracks as it has workers, without losing CPU time.            |
 | `short_lived`       | *Limitation*: children living shorter than a sampling interval get only part of their CPU attributed.         |
 | `memory_steps`      | RSS follows allocations and frees, memory growth is attributed to the function that allocates.                 |
 | `memory_semantics`  | Reserved-but-untouched memory does not count, memory from native `malloc` does (tracemalloc misses it).        |
