@@ -535,7 +535,7 @@ def run_scenario(name: str, args, cpus: int) -> tuple[str, list[Result]]:
     profile_dir, truth_file = output / "profile", output / "truth.json"
 
     command = [
-        args.binary, "profile", "--yes",
+        args.binary, "profile", "py-spy", "--yes",
         "--interval", str(args.interval),
         "--output-dir", str(profile_dir),
         *PROFILER_ARGS.get(name, []),

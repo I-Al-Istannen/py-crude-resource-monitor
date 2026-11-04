@@ -1,12 +1,10 @@
 use crate::memory_sampler::MemorySampler;
 use crate::resources::SystemMeasurements;
 use crate::samples::{SampleFile, StackTable, write_line};
-use crate::stacktraces::SpyHelper;
-use crate::types::{
-    self, JsonLine, MemorySample, NativeCapture, ProcessMetadata, ProcessResources,
-};
+use crate::stacktraces::{SpyHelper, StackBackend, StackSampler};
+use crate::tachyon::{TachyonError, TachyonHelper};
+use crate::types::{JsonLine, MemorySample, ProcessMetadata, ProcessResources, StackTrace};
 use log::{info, trace};
-use py_spy::StackTrace;
 use snafu::{Location, ResultExt, Snafu};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -20,6 +18,12 @@ pub enum TrackerError {
     #[snafu(display("Could not find process {pid} at {location}"))]
     ProcessNotFound {
         pid: u32,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Error capturing stacks with tachyon at {location}"))]
+    Tachyon {
+        source: TachyonError,
         #[snafu(implicit)]
         location: Location,
     },
@@ -64,7 +68,7 @@ struct WriteRequest {
 pub struct Tracker {
     /// The root process and its descendants that were alive during the last tick
     processes: HashMap<sysinfo::Pid, ProcessMetadata>,
-    spies: SpyHelper,
+    spies: StackSampler,
     system: SystemMeasurements,
     memory_sampler: Option<MemorySampler>,
     writer_channel: mpsc::SyncSender<WriteRequest>,
@@ -75,7 +79,7 @@ impl Tracker {
     pub fn new(
         pid: u32,
         output_dir: PathBuf,
-        native_capture: NativeCapture,
+        backend: &StackBackend,
         record_pss: bool,
         memory_interval: Option<Duration>,
         compress: bool,
@@ -92,13 +96,23 @@ impl Tracker {
             .transpose()
             .context(SystemMeasurementsSnafu)?;
 
+        let spies = match backend {
+            StackBackend::PySpy {
+                native_capture,
+                nonblocking,
+            } => StackSampler::PySpy(SpyHelper::new(*native_capture, *nonblocking)),
+            StackBackend::Tachyon { python, pause } => {
+                StackSampler::Tachyon(TachyonHelper::new(python, *pause).context(TachyonSnafu)?)
+            }
+        };
+
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(100);
 
         let writer_thread = thread::spawn(move || write_samples(rx, output_dir, compress));
 
         Ok(Self {
             processes,
-            spies: SpyHelper::new(native_capture),
+            spies,
             system,
             memory_sampler,
             writer_channel: tx,
@@ -263,7 +277,7 @@ fn write_samples(
             let stacktraces = req
                 .stacktraces
                 .into_iter()
-                .map(|trace| stack_table.store(types::StackTrace::from(trace), &mut *file))
+                .map(|trace| stack_table.store(trace, &mut *file))
                 .collect::<Result<_, _>>()
                 .context(SerializeSampleSnafu)?;
             let line = JsonLine {

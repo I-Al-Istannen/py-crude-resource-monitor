@@ -3,17 +3,19 @@ mod memory_sampler;
 mod resources;
 mod samples;
 mod stacktraces;
+mod tachyon;
 mod tracker;
 mod types;
 mod view;
 
 use crate::export::FirefoxExportArguments;
+use crate::stacktraces::StackBackend;
 use crate::tracker::{Tracker, TrackerError};
 use crate::types::NativeCapture;
 use crate::view::ViewError;
 use clap::builder::Styles;
 use clap::builder::styling::AnsiColor;
-use clap::{ArgGroup, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use dialoguer::Confirm;
 use dialoguer::theme::ColorfulTheme;
 use log::{debug, error, info, warn};
@@ -34,7 +36,7 @@ const CLAP_STYLE: Styles = Styles::styled()
 /// A small utility to monitor resource usage of Python processes
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None, styles = CLAP_STYLE)]
-struct Args {
+struct CliArgs {
     #[command(subcommand)]
     command: Subcommands,
 }
@@ -42,51 +44,9 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Subcommands {
     /// Profile a Python process
-    #[clap(group(ArgGroup::new("target").required(true).args(&["pid", "command"])))]
     Profile {
-        /// The PID of the Python process to monitor
-        #[arg(short, long)]
-        pid: Option<u32>,
-        /// The command to execute
-        #[clap(conflicts_with = "pid")]
-        command: Option<Vec<String>>,
-        /// output directory
-        #[arg(short, long)]
-        output_dir: PathBuf,
-        /// Milliseconds between samples
-        #[arg(
-            short,
-            long,
-            value_name = "MS",
-            default_value_t = 1000,
-            alias = "sample-rate",
-            short_alias = 's'
-        )]
-        interval: u64,
-        /// Milliseconds between memory measurements taken in between the samples, so short
-        /// allocation spikes are not missed. Only changes are stored. 0 disables them.
-        #[arg(long, value_name = "MS", default_value_t = 10)]
-        memory_interval: u64,
-        /// Also record the proportional set size (PSS) of every process, which splits memory
-        /// shared between processes, e.g. after a fork, between them. Linux only. Reading it takes
-        /// longer the more memory a process uses.
-        #[arg(long)]
-        pss: bool,
-        /// Write the samples as plain JSON lines instead of compressing them with zstd, e.g. to
-        /// follow them with `tail -f`. They take up several times as much space.
-        #[arg(long)]
-        uncompressed: bool,
-        /// Delete samples from a previous run in the output directory without asking
-        #[arg(short, long)]
-        yes: bool,
-        #[cfg(feature = "unwind")]
-        /// capture native stack traces. If given without a value, defaults to `native-stacks`.
-        #[arg(long, default_value_t = NativeCapture::None, default_missing_value = "native-stacks", num_args(0..=1))]
-        native: NativeCapture,
-        #[cfg(not(feature = "unwind"))]
-        /// capture native stack traces (not compiled, enable with `unwind` build feature)
-        #[arg(long, default_value_t = NativeCapture::None, default_missing_value = "native-stacks", num_args(0..=1))]
-        native: NativeCapture,
+        #[command(subcommand)]
+        backend: ProfileBackend,
     },
     /// Host a web server to view the profile data
     View {
@@ -104,6 +64,84 @@ enum Subcommands {
     Export {
         #[command(subcommand)]
         export_subcommand: ExportSubcommand,
+    },
+}
+
+/// The options of `profile` that do not depend on how the stacks are captured
+#[derive(Args, Debug)]
+#[clap(group(ArgGroup::new("target").required(true).args(&["pid", "command"])))]
+struct ProfileArgs {
+    /// The PID of the Python process to monitor
+    #[arg(short, long)]
+    pid: Option<u32>,
+    /// The command to execute
+    #[clap(conflicts_with = "pid")]
+    command: Option<Vec<String>>,
+    /// output directory
+    #[arg(short, long)]
+    output_dir: PathBuf,
+    /// Milliseconds between samples
+    #[arg(
+        short,
+        long,
+        value_name = "MS",
+        default_value_t = 1000,
+        alias = "sample-rate",
+        short_alias = 's'
+    )]
+    interval: u64,
+    /// Milliseconds between memory measurements taken in between the samples, so short
+    /// allocation spikes are not missed. Only changes are stored. 0 disables them.
+    #[arg(long, value_name = "MS", default_value_t = 10)]
+    memory_interval: u64,
+    /// Also record the proportional set size (PSS) of every process, which splits memory
+    /// shared between processes, e.g. after a fork, between them. Linux only. Reading it takes
+    /// longer the more memory a process uses.
+    #[arg(long)]
+    pss: bool,
+    /// Write the samples as plain JSON lines instead of compressing them with zstd, e.g. to
+    /// follow them with `tail -f`. They take up several times as much space.
+    #[arg(long)]
+    uncompressed: bool,
+    /// Delete samples from a previous run in the output directory without asking
+    #[arg(short, long)]
+    yes: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum ProfileBackend {
+    /// Capture the Python stacks with py-spy
+    #[command(name = "py-spy")]
+    PySpy {
+        #[command(flatten)]
+        args: ProfileArgs,
+        /// Do not pause the profiled processes while capturing their stacks. This makes sampling
+        /// cheaper for them, but the stacks can be inconsistent, e.g. contain frames that already
+        /// returned.
+        #[arg(long, conflicts_with = "native")]
+        nonblocking: bool,
+        #[cfg(feature = "unwind")]
+        /// capture native stack traces. If given without a value, defaults to `native-stacks`.
+        #[arg(long, default_value_t = NativeCapture::None, default_missing_value = "native-stacks", num_args(0..=1))]
+        native: NativeCapture,
+        #[cfg(not(feature = "unwind"))]
+        /// capture native stack traces (not compiled, enable with `unwind` build feature)
+        #[arg(long, default_value_t = NativeCapture::None, default_missing_value = "native-stacks", num_args(0..=1))]
+        native: NativeCapture,
+    },
+    /// Capture the Python stacks with Tachyon, the sampling profiler built into CPython 3.15
+    ///
+    /// It can only profile processes with the same Python minor version as `--python`.
+    Tachyon {
+        #[command(flatten)]
+        args: ProfileArgs,
+        /// The Python interpreter Tachyon runs on
+        #[arg(long, value_name = "PYTHON", default_value = "python3.15")]
+        python: PathBuf,
+        /// Pause the profiled processes while capturing their stacks. Otherwise the stacks can be
+        /// inconsistent, e.g. contain frames that already returned.
+        #[arg(long)]
+        pause: bool,
     },
 }
 
@@ -200,32 +238,27 @@ fn main() -> Result<(), ApplicationError> {
         env_logger::Env::default().filter_or("RUST_LOG", "py_crude_resource_monitor=info"),
     );
 
-    let args = Args::parse();
+    let args = CliArgs::parse();
 
     let res = match args.command {
-        Subcommands::Profile {
-            pid,
-            output_dir,
-            interval,
-            memory_interval,
-            pss,
-            uncompressed,
-            yes,
-            native,
-            command,
-        } => run_profile(
-            pid,
-            command,
-            output_dir,
-            ProfileOptions {
-                interval_millis: interval,
-                memory_interval_millis: memory_interval,
-                record_pss: pss,
-                compress: !uncompressed,
-                native_capture: native,
-            },
-            yes,
-        )?,
+        Subcommands::Profile { backend } => match backend {
+            ProfileBackend::PySpy {
+                args,
+                nonblocking,
+                native,
+            } => run_profile(
+                args,
+                StackBackend::PySpy {
+                    native_capture: native,
+                    nonblocking,
+                },
+            )?,
+            ProfileBackend::Tachyon {
+                args,
+                python,
+                pause,
+            } => run_profile(args, StackBackend::Tachyon { python, pause })?,
+        },
         Subcommands::View {
             output_dir,
             interface,
@@ -273,28 +306,20 @@ fn main() -> Result<(), ApplicationError> {
     Ok(())
 }
 
-struct ProfileOptions {
-    interval_millis: u64,
-    memory_interval_millis: u64,
-    record_pss: bool,
-    compress: bool,
-    native_capture: NativeCapture,
-}
-
 fn run_profile(
-    pid: Option<u32>,
-    command: Option<Vec<String>>,
-    output_dir: PathBuf,
-    options: ProfileOptions,
-    skip_confirmation: bool,
+    args: ProfileArgs,
+    backend: StackBackend,
 ) -> Result<Option<ExitStatus>, ApplicationError> {
-    let ProfileOptions {
-        interval_millis,
-        memory_interval_millis,
-        record_pss,
-        compress,
-        native_capture,
-    } = options;
+    let ProfileArgs {
+        pid,
+        command,
+        output_dir,
+        interval: interval_millis,
+        memory_interval: memory_interval_millis,
+        pss: record_pss,
+        uncompressed,
+        yes: skip_confirmation,
+    } = args;
     #[cfg(target_os = "macos")]
     {
         // On macOS, we need to be root to profile processes
@@ -307,7 +332,10 @@ fn run_profile(
         }
     }
 
-    if native_capture.anything() && !cfg!(feature = "unwind") {
+    if let StackBackend::PySpy { native_capture, .. } = &backend
+        && native_capture.anything()
+        && !cfg!(feature = "unwind")
+    {
         error!("This binary was compiled without support for capturing native stacktraces");
         return Err(MissingUnwindSupportSnafu.into_error(NoneError));
     }
@@ -339,10 +367,10 @@ fn run_profile(
     let mut tracker = Tracker::new(
         pid,
         output_dir.clone(),
-        native_capture,
+        &backend,
         record_pss,
         memory_interval,
-        compress,
+        !uncompressed,
     )
     .context(TrackerSnafu)?;
     info!("Tracking started");
