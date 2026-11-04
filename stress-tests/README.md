@@ -34,6 +34,7 @@ summary, and if the suite fails, the `results/` directory is uploaded as an arti
 | `pool_cpu`          | Pool workers are discovered and accounted separately, the parent is idle in `Pool.map`.                        |
 | `child_processes`   | Python grandchildren behind a shell are profiled, non-Python children get resources without stacks.           |
 | `native_stacks`     | With `--native`, samples show the C functions (zlib's `deflate`) below the Python frame calling them.        |
+| `polars_query`      | With `--native all`, polars' Rust worker threads, which never run Python code, are captured with their stacks. |
 | `pool_churn`        | A pool recreated 30 times fills as many Firefox tracks as it has workers, without losing CPU time.            |
 | `short_lived`       | *Limitation*: children living shorter than a sampling interval get only part of their CPU attributed.         |
 | `memory_steps`      | RSS follows allocations and frees, memory growth is attributed to the function that allocates.                 |
