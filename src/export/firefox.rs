@@ -4,13 +4,14 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use fxprof_processed_profile::{
     CategoryColor, CategoryHandle, CounterHandle, CpuDelta, Frame, FrameFlags, FrameInfo,
-    GraphColor, ProcessHandle, Profile, ReferenceTimestamp, SamplingInterval, ThreadHandle,
-    Timestamp,
+    GraphColor, MarkerFieldFlags, MarkerFieldFormat, MarkerTiming, ProcessHandle, Profile,
+    ReferenceTimestamp, SamplingInterval, StaticSchemaMarker, StaticSchemaMarkerField,
+    StringHandle, ThreadHandle, Timestamp,
 };
 use log::info;
 use snafu::{Location, OptionExt, ResultExt, Snafu, Whatever};
 use std::borrow::Borrow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -146,7 +147,7 @@ impl ProfileBuilder {
         };
         let (start, end) = (first_sample.time, samples.last().unwrap().time);
 
-        let mut process = ProfileBuilderProcess::new(self, "Global", 0, start);
+        let mut process = ProfileBuilderProcess::new(self, "Global", 0, start, false);
         // Global CPU is meant to be divided by the number of cores, 100% means all cores are busy
         process.add_label_samples("Global", samples, |line| line.resources.cpu);
         process.finish(end);
@@ -155,15 +156,30 @@ impl ProfileBuilder {
     }
 
     /// Adds processes that ran one after another as a single process to the profile.
-    fn add_lane(&mut self, lane: Vec<Instance>) -> Result<(), Whatever> {
+    /// Adds processes that ran one after another as a single process to the profile. With
+    /// `pack_threads`, threads are packed into lanes too, see [`ProfileBuilderProcess`].
+    fn add_lane(&mut self, lane: Vec<Instance>, pack_threads: bool) -> Result<(), Whatever> {
         let (Some(first), Some(last)) = (lane.first(), lane.last()) else {
             return Ok(());
         };
         let (pid, start, end) = (first.pid, first.start(), last.end());
-        let name = first.name().to_string();
+        let name = match lane.len() {
+            1 => first.name().to_string(),
+            count => format!("{} ({count} processes)", first.name()),
+        };
+        let shared = lane.len() > 1;
 
-        let mut process = ProfileBuilderProcess::new(self, &name, pid, start);
+        let mut process = ProfileBuilderProcess::new(self, &name, pid, start, pack_threads);
+        let mut previous_end = None;
         for instance in lane {
+            if shared {
+                if let Some(previous_end) = previous_end {
+                    // Don't let the memory of the previous process linger until the next starts
+                    process.reset_counters((previous_end + instance.start()) / 2);
+                }
+                process.add_lifetime_marker(&instance);
+            }
+            previous_end = Some(instance.end());
             process.add_instance(instance)?;
         }
         process.finish(end);
@@ -227,20 +243,31 @@ impl Instance {
     }
 }
 
-/// A process in the Firefox profile
+/// A process in the Firefox profile. With `pack_threads`, threads whose names only differ in
+/// numbers and that never ran at the same time share a Firefox thread, so recreated thread pools
+/// don't add a thread per run.
 struct ProfileBuilderProcess<'a> {
     parent: &'a mut ProfileBuilder,
     process: ProcessHandle,
     main_thread: ThreadHandle,
-    /// All threads except the main thread, by their thread id
-    threads: HashMap<u64, ThreadHandle>,
+    /// All threads except the main thread
+    threads: HashMap<ThreadKey, ThreadHandle>,
+    pack_threads: bool,
+    /// For packed threads, the end of each lane per normalized thread name
+    thread_lane_ends: HashMap<String, Vec<u128>>,
     thread_end_times: HashMap<ThreadHandle, Timestamp>,
     memory_counter: ProfileCounter<Initialized>,
     io_counter: Option<ProfileCounter<Initialized>>,
 }
 
 impl<'a> ProfileBuilderProcess<'a> {
-    pub fn new(parent: &'a mut ProfileBuilder, name: &str, pid: u32, start_millis: u128) -> Self {
+    pub fn new(
+        parent: &'a mut ProfileBuilder,
+        name: &str,
+        pid: u32,
+        start_millis: u128,
+        pack_threads: bool,
+    ) -> Self {
         assert!(start_millis >= parent.start_time_millis);
 
         let start_timestamp = parent.time(start_millis);
@@ -286,6 +313,8 @@ impl<'a> ProfileBuilderProcess<'a> {
             process,
             main_thread,
             threads: HashMap::new(),
+            pack_threads,
+            thread_lane_ends: HashMap::new(),
             thread_end_times: HashMap::new(),
             memory_counter,
             io_counter,
@@ -347,7 +376,44 @@ impl<'a> ProfileBuilderProcess<'a> {
         }
     }
 
+    /// Decides which Firefox thread each thread of one process goes to
+    fn thread_keys(
+        &mut self,
+        samples: &[JsonLine],
+        main_thread_id: u64,
+    ) -> HashMap<u64, ThreadKey> {
+        if !self.pack_threads {
+            return HashMap::new();
+        }
+        // The name and lifetime of each thread
+        let mut threads: HashMap<u64, (String, u128, u128)> = HashMap::new();
+        for line in samples {
+            for stacktrace in &line.stacktraces {
+                if stacktrace.thread_id == main_thread_id {
+                    continue;
+                }
+                let name = normalize_thread_name(stacktrace.thread_name.as_deref());
+                threads
+                    .entry(stacktrace.thread_id)
+                    .and_modify(|(_, _, end)| *end = line.time)
+                    .or_insert((name, line.time, line.time));
+            }
+        }
+        let mut threads = threads.into_iter().collect::<Vec<_>>();
+        threads.sort_by_key(|(id, (_, start, _))| (*start, *id));
+
+        threads
+            .into_iter()
+            .map(|(id, (name, start, end))| {
+                let lane_ends = self.thread_lane_ends.entry(name.clone()).or_default();
+                let lane = assign_lane(lane_ends, start, end);
+                (id, ThreadKey::Lane(name, lane))
+            })
+            .collect()
+    }
+
     fn add_stack_samples(&mut self, samples: Vec<JsonLine>, main_thread_id: u64) {
+        let thread_keys = self.thread_keys(&samples, main_thread_id);
         for line in samples {
             let timestamp = self.time(line.time);
 
@@ -355,17 +421,29 @@ impl<'a> ProfileBuilderProcess<'a> {
                 let thread = if stacktrace.thread_id == main_thread_id {
                     self.main_thread
                 } else {
-                    let thread = *self.threads.entry(stacktrace.thread_id).or_insert_with(|| {
-                        self.parent.profile.add_thread(
-                            self.process,
-                            stacktrace.thread_id as u32,
-                            timestamp,
-                            false,
-                        )
-                    });
+                    let key = thread_keys
+                        .get(&stacktrace.thread_id)
+                        .cloned()
+                        .unwrap_or(ThreadKey::Id(stacktrace.thread_id));
+                    let thread = match self.threads.get(&key) {
+                        Some(thread) => *thread,
+                        None => {
+                            let thread = self.parent.profile.add_thread(
+                                self.process,
+                                stacktrace.thread_id as u32,
+                                timestamp,
+                                false,
+                            );
+                            if let ThreadKey::Lane(name, _) = &key {
+                                self.parent.profile.set_thread_name(thread, name);
+                            }
+                            self.threads.insert(key.clone(), thread);
+                            thread
+                        }
+                    };
                     // thread name might not be set in first line of the file, so we set it in
                     // every sample we find.
-                    if let Some(thread_name) = stacktrace.thread_name {
+                    if let (ThreadKey::Id(_), Some(thread_name)) = (&key, stacktrace.thread_name) {
                         self.parent
                             .profile
                             .set_thread_name(thread, thread_name.as_str());
@@ -439,6 +517,35 @@ impl<'a> ProfileBuilderProcess<'a> {
                 (resources.disk_read_bytes + resources.disk_write_bytes) as f64,
             );
         }
+    }
+
+    fn reset_counters(&mut self, millis: u128) {
+        let timestamp = self.time(millis);
+        self.add_counter_values(
+            timestamp,
+            &ProcessResources {
+                memory: 0,
+                cpu: 0.0,
+                cpus: None,
+                disk_read_bytes: 0,
+                disk_write_bytes: 0,
+                thread_resources: HashMap::new(),
+            },
+        );
+    }
+
+    /// Marks when a process sharing this Firefox process was alive
+    fn add_lifetime_marker(&mut self, instance: &Instance) {
+        let timing = MarkerTiming::Interval(self.time(instance.start()), self.time(instance.end()));
+        let name = self.parent.profile.intern_string(instance.name());
+        self.parent.profile.add_marker(
+            self.main_thread,
+            timing,
+            ProcessLifetimeMarker {
+                name,
+                pid: instance.pid,
+            },
+        );
     }
 
     /// Ends the process and all its threads. Threads that were last seen earlier end then.
@@ -567,10 +674,134 @@ pub struct FirefoxExportArguments {
     /// Whether to include bandwidth usage in the export
     #[arg(long, default_value_t = false)]
     bandwidth: bool,
+    /// Whether processes with the same parent and name that never run at the same time share a
+    /// track. Recreated worker pools otherwise get a track per process.
+    #[arg(long, value_enum, default_value_t = ProcessLanes::Auto)]
+    lanes: ProcessLanes,
     /// The directory containing the profile data
     data_dir: PathBuf,
     /// The output file to write the gz-compressed JSON to
     output_file: PathBuf,
+}
+
+/// More processes than this are packed into lanes by default
+const AUTO_LANES_THRESHOLD: usize = 50;
+
+/// Long-running programs that recreate worker pools spawn thousands of short-lived processes. With
+/// a track per process, the Firefox Profiler becomes unusable. Lanes pack processes with the same
+/// parent and name that never run at the same time into one track, so the number of tracks is
+/// the number of processes running at the same time.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessLanes {
+    /// Share tracks if there are more than 50 processes
+    Auto,
+    /// Always share tracks
+    Always,
+    /// Give every process its own track
+    Never,
+}
+
+/// Packs processes into lanes, see [`ProcessLanes`]. Processes running for more than half of the
+/// profile keep their own track.
+fn pack_processes(instances: Vec<Instance>, profile_duration: u128) -> Vec<Vec<Instance>> {
+    let mut lanes = Vec::new();
+    let mut groups: BTreeMap<(Option<u32>, String), Vec<Instance>> = BTreeMap::new();
+    for instance in instances {
+        let long_lived = (instance.end() - instance.start()) * 2 > profile_duration;
+        match &instance.samples[0].process {
+            Some(metadata) if !long_lived => groups
+                .entry((metadata.parent_pid, metadata.name.clone()))
+                .or_default()
+                .push(instance),
+            _ => lanes.push(vec![instance]),
+        }
+    }
+
+    for group in groups.into_values() {
+        let first_lane = lanes.len();
+        let mut lane_ends = Vec::new();
+        // The instances are sorted by start time
+        for instance in group {
+            let lane = first_lane + assign_lane(&mut lane_ends, instance.start(), instance.end());
+            if lane == lanes.len() {
+                lanes.push(Vec::new());
+            }
+            lanes[lane].push(instance);
+        }
+    }
+
+    lanes
+}
+
+/// Returns the first lane that is free at `start` and occupies it until `end`. Lanes are
+/// identified by their index in `lane_ends`, which holds when each lane is free again.
+fn assign_lane(lane_ends: &mut Vec<u128>, start: u128, end: u128) -> usize {
+    match lane_ends.iter().position(|lane_end| *lane_end < start) {
+        Some(lane) => {
+            lane_ends[lane] = end;
+            lane
+        }
+        None => {
+            lane_ends.push(end);
+            lane_ends.len() - 1
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ThreadKey {
+    Id(u64),
+    /// A normalized thread name and the lane among threads with that name
+    Lane(String, usize),
+}
+
+/// Replaces numbers in a thread name, so `ThreadPoolExecutor-17_3` becomes `ThreadPoolExecutor-#_#`
+fn normalize_thread_name(name: Option<&str>) -> String {
+    let mut normalized = String::new();
+    for c in name.unwrap_or("unnamed").chars() {
+        if !c.is_ascii_digit() {
+            normalized.push(c);
+        } else if !normalized.ends_with('#') {
+            normalized.push('#');
+        }
+    }
+    normalized
+}
+
+/// Marks when a process that shares a track with others was alive
+struct ProcessLifetimeMarker {
+    name: StringHandle,
+    pid: u32,
+}
+
+impl StaticSchemaMarker for ProcessLifetimeMarker {
+    const UNIQUE_MARKER_TYPE_NAME: &'static str = "ProcessLifetime";
+    // Only the pid fits into the boxes of short-lived processes
+    const CHART_LABEL: Option<&'static str> = Some("{marker.data.pid}");
+    const TOOLTIP_LABEL: Option<&'static str> = Some("{marker.name} {marker.data.pid}");
+    const TABLE_LABEL: Option<&'static str> = Some("{marker.name} {marker.data.pid}");
+    const FIELDS: &'static [StaticSchemaMarkerField] = &[StaticSchemaMarkerField {
+        key: "pid",
+        label: "PID",
+        format: MarkerFieldFormat::Integer,
+        flags: MarkerFieldFlags::empty(),
+    }];
+
+    fn name(&self, _profile: &mut Profile) -> StringHandle {
+        self.name
+    }
+
+    fn category(&self, _profile: &mut Profile) -> CategoryHandle {
+        CategoryHandle::OTHER
+    }
+
+    fn string_field_value(&self, _field_index: u32) -> StringHandle {
+        unreachable!("the marker has no string fields")
+    }
+
+    fn number_field_value(&self, _field_index: u32) -> f64 {
+        self.pid as f64
+    }
 }
 
 pub(super) fn export_report(args: FirefoxExportArguments) -> Result<(), ExportError> {
@@ -593,6 +824,8 @@ fn generate_fxprof(
     args: &FirefoxExportArguments,
 ) -> Result<Profile, Whatever> {
     let mut builder = ProfileBuilder::from_samples(|| processes.values(), args.bandwidth)?;
+    let end_millis = processes.values().flatten().map(|it| it.time).max();
+    let duration_millis = end_millis.unwrap_or_default() - builder.start_time_millis;
 
     let mut instances = Vec::new();
     for (identifier, samples) in processes {
@@ -604,8 +837,21 @@ fn generate_fxprof(
     // Ensure the report is deterministic
     instances.sort_by_key(|it| (it.start(), it.pid));
 
-    for instance in instances {
-        builder.add_lane(vec![instance])?;
+    let pack = match args.lanes {
+        ProcessLanes::Auto => instances.len() > AUTO_LANES_THRESHOLD,
+        ProcessLanes::Always => true,
+        ProcessLanes::Never => false,
+    };
+    let lanes = if pack {
+        let count = instances.len();
+        let lanes = pack_processes(instances, duration_millis);
+        info!("Packed {count} processes into {} lanes", lanes.len());
+        lanes
+    } else {
+        instances.into_iter().map(|it| vec![it]).collect()
+    };
+    for lane in lanes {
+        builder.add_lane(lane, pack)?;
     }
 
     Ok(builder.finish())
@@ -690,6 +936,7 @@ mod tests {
     fn args() -> FirefoxExportArguments {
         FirefoxExportArguments {
             bandwidth: true,
+            lanes: ProcessLanes::Never,
             data_dir: PathBuf::new(),
             output_file: PathBuf::new(),
         }
@@ -861,5 +1108,105 @@ mod tests {
             thread_cpu_deltas(processes, "Process"),
             serde_json::json!([0, 0, 0])
         );
+    }
+
+    /// Samples of a process with the given threads, one every 100ms from `start` to `end`
+    fn process(name: &str, start: u128, end: u128, threads: &[(u64, &str)]) -> Vec<JsonLine> {
+        (start..=end)
+            .step_by(100)
+            .map(|time| {
+                let stacktraces = threads
+                    .iter()
+                    .map(|(id, thread)| stacktrace(*id, thread))
+                    .collect();
+                let mut line = line(time, stacktraces, &[]);
+                line.process = Some(metadata(name, start as u64));
+                line
+            })
+            .collect()
+    }
+
+    fn thread_names(json: &serde_json::Value) -> Vec<String> {
+        let mut names = json["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn packs_processes_that_never_overlap_into_lanes() {
+        let main = [(1, MAIN_THREAD_NAME)];
+        let mut processes =
+            HashMap::from([(ReportIdentifier::Pid(1), process("root", 1000, 3000, &main))]);
+        // A pool of two workers, recreated three times
+        for run in 0..3 {
+            for worker in 0..2 {
+                let start = 1100 + run * 600;
+                let pid = 10 + (run * 2 + worker) as u32;
+                processes.insert(
+                    ReportIdentifier::Pid(pid),
+                    process("worker", start, start + 400, &main),
+                );
+            }
+        }
+        let mut args = args();
+        args.lanes = ProcessLanes::Always;
+
+        let profile = generate_fxprof(processes, &args).unwrap();
+        let json = serde_json::to_value(&profile).unwrap();
+
+        // The long-lived root keeps its own track, the workers share two
+        assert_eq!(
+            thread_names(&json),
+            ["root", "worker (3 processes)", "worker (3 processes)"]
+        );
+        let markers = json["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["markers"]["length"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(markers.iter().sum::<u64>(), 6);
+    }
+
+    #[test]
+    fn packs_threads_with_the_same_name_that_never_overlap() {
+        let mut samples = process(
+            "python",
+            1000,
+            1200,
+            &[(1, MAIN_THREAD_NAME), (2, "Pool-1_0")],
+        );
+        samples.extend(process(
+            "python",
+            1300,
+            1500,
+            &[(1, MAIN_THREAD_NAME), (3, "Pool-2_0"), (4, "Pool-2_1")],
+        ));
+        for line in &mut samples {
+            line.process = Some(metadata("python", 1));
+        }
+        let mut args = args();
+        args.lanes = ProcessLanes::Always;
+
+        let profile =
+            generate_fxprof(HashMap::from([(ReportIdentifier::Pid(1), samples)]), &args).unwrap();
+        let json = serde_json::to_value(&profile).unwrap();
+
+        // Pool-1_0 and Pool-2_0 share a thread, Pool-2_1 runs at the same time as Pool-2_0
+        assert_eq!(thread_names(&json), ["Pool-#_#", "Pool-#_#", "python"]);
+    }
+
+    #[test]
+    fn normalizes_numbers_in_thread_names() {
+        assert_eq!(
+            normalize_thread_name(Some("ThreadPoolExecutor-17_3")),
+            "ThreadPoolExecutor-#_#"
+        );
+        assert_eq!(normalize_thread_name(None), "unnamed");
     }
 }

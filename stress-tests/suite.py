@@ -308,6 +308,34 @@ def check_child_coverage(profile, truth, phase, check):
     )
 
 
+def check_firefox_lanes(profile, truth, phase, check):
+    """Number of tracks the worker processes take up in the Firefox export."""
+    workers = len(profile.processes) - 1
+    tracks = [
+        t
+        for t in profile.firefox_threads()
+        if t["isMainThread"] and t["pid"] not in (str(truth["pid"]), "0")
+    ]
+    status = PASS if len(tracks) <= check["max_tracks"] else FAIL
+    return (
+        status,
+        f"<= {check['max_tracks']} tracks for {workers} workers",
+        f"{len(tracks)} tracks",
+    )
+
+
+def check_firefox_cpu_total(profile, truth, phase, check):
+    """The Firefox export contains the CPU time of all processes, even if they share tracks."""
+    raw = sum(profile.cpu_seconds(samples) for samples in profile.processes.values())
+    exported = sum(
+        sum(t["samples"]["threadCPUDelta"]) / 1e6
+        for t in profile.firefox_threads()
+        if t["pid"] != "0"
+    )
+    status = PASS if within(exported, raw, 0.5, 0.05) else FAIL
+    return status, f"{raw:.2f} CPU-s in the profile", f"{exported:.2f} CPU-s exported"
+
+
 def check_cpu_integral(profile, truth, phase, check):
     measured = profile.cpu_seconds(profile.processes.get(truth["pid"], []))
     expected = truth["total_cpu_seconds"]
@@ -327,6 +355,8 @@ CHECKS = {
     "child_cpu": check_child_cpu,
     "global_cpu_delta": check_global_cpu_delta,
     "child_coverage": check_child_coverage,
+    "firefox_lanes": check_firefox_lanes,
+    "firefox_cpu_total": check_firefox_cpu_total,
     "cpu_integral": check_cpu_integral,
 }
 
