@@ -775,7 +775,8 @@ struct ProcessLifetimeMarker {
 
 impl StaticSchemaMarker for ProcessLifetimeMarker {
     const UNIQUE_MARKER_TYPE_NAME: &'static str = "ProcessLifetime";
-    const CHART_LABEL: Option<&'static str> = Some("{marker.name} {marker.data.pid}");
+    // Only the pid fits into the boxes of short-lived processes
+    const CHART_LABEL: Option<&'static str> = Some("{marker.data.pid}");
     const TOOLTIP_LABEL: Option<&'static str> = Some("{marker.name} {marker.data.pid}");
     const TABLE_LABEL: Option<&'static str> = Some("{marker.name} {marker.data.pid}");
     const FIELDS: &'static [StaticSchemaMarkerField] = &[StaticSchemaMarkerField {
