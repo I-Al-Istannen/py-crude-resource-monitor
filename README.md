@@ -69,15 +69,15 @@ Arguments:
   [COMMAND]...  The command to execute
 
 Options:
-  -p, --pid <PID>                  The PID of the Python process to monitor
-  -o, --output-dir <OUTPUT_DIR>    output directory
-  -s, --sample-rate <SAMPLE_RATE>  ms between samples
-  -y, --yes                        Delete samples from a previous run in the output directory
-                                   without asking
-      --native [<NATIVE>]          capture native stack traces. If given without a value, defaults
-                                   to `native-stacks`. [default: none] [possible values:
-                                   native-stacks, all, none]
-  -h, --help                       Print help (see more with '--help')
+  -p, --pid <PID>                The PID of the Python process to monitor
+  -o, --output-dir <OUTPUT_DIR>  output directory
+  -i, --interval <MS>            Milliseconds between samples [default: 1000]
+  -y, --yes                      Delete samples from a previous run in the output directory without
+                                 asking
+      --native [<NATIVE>]        capture native stack traces. If given without a value, defaults to
+                                 `native-stacks`. [default: none] [possible values: native-stacks,
+                                 all, none]
+  -h, --help                     Print help (see more with '--help')
 ```
 
 ```text
