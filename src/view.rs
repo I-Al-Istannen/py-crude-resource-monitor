@@ -28,9 +28,10 @@ pub enum ViewError {
     },
 }
 
+/// The built frontend, embedded into the binary
 #[derive(Embed)]
 #[folder = "frontend/dist/"]
-struct Asset;
+pub struct Asset;
 
 pub async fn run_view(output_dir: PathBuf, interface: &str, port: u16) -> Result<(), ViewError> {
     let app = Router::new()
