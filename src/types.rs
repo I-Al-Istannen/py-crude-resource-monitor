@@ -5,9 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
 
+/// A sample of a process. In the files, the threads are [`StoredStackTrace`]s, see
+/// [`crate::samples`].
 #[derive(Serialize, Deserialize, Debug)]
-pub struct JsonLine {
-    pub stacktraces: Vec<StackTrace>,
+pub struct JsonLine<S = StackTrace> {
+    pub stacktraces: Vec<S>,
     /// Set if capturing the stacktraces failed for this sample. The resources are still valid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stacktrace_error: Option<String>,
@@ -94,13 +96,34 @@ impl From<py_spy::StackTrace> for StackTrace {
     }
 }
 
+/// A thread as stored in the sample files: its frames are written once and referenced by the id
+/// of the innermost one, see [`crate::samples`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredStackTrace {
+    pub pid: Pid,
+    pub thread_id: u64,
+    pub thread_name: Option<String>,
+    pub os_thread_id: Option<u64>,
+    pub active: bool,
+    pub owns_gil: bool,
+    /// `None` if the thread has no frames
+    #[serde(default)]
+    pub stack: Option<u32>,
+    /// Profiles written by older versions store the frames of every sample instead of `stack`
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: Vec<Frame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_info: Option<ProcessInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Frame {
     pub name: String,
     pub filename: String,
     pub module: Option<String>,
     pub short_filename: Option<String>,
     pub line: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locals: Option<Vec<LocalVariable>>,
     pub is_entry: bool,
 }
@@ -121,7 +144,7 @@ impl From<py_spy::Frame> for Frame {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LocalVariable {
     pub name: String,
     pub addr: usize,
@@ -219,14 +242,14 @@ mod tests {
         // Written by versions before `stacktrace_error` existed
         let line = r#"{"stacktraces":[],"resources":{"memory":1,"cpu":2.0,"disk_read_bytes":0,"disk_write_bytes":0,"thread_resources":{}},"index":0,"time":1000}"#;
 
-        let line: JsonLine = serde_json::from_str(line).unwrap();
+        let line: JsonLine<StoredStackTrace> = serde_json::from_str(line).unwrap();
 
         assert_eq!(line.stacktrace_error, None);
     }
 
     #[test]
     fn omits_missing_stacktrace_error() {
-        let line = JsonLine {
+        let line: JsonLine = JsonLine {
             stacktraces: vec![],
             stacktrace_error: None,
             process: None,

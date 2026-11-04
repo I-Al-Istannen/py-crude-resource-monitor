@@ -1,6 +1,7 @@
 mod export;
 mod memory_sampler;
 mod resources;
+mod samples;
 mod stacktraces;
 mod tracker;
 mod types;
