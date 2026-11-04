@@ -2,9 +2,9 @@ use crate::types::NativeCapture;
 use log::{debug, info, warn};
 use py_spy::{Config, PythonSpy, StackTrace};
 use snafu::{Location, ResultExt, Snafu};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-/// How often we try to attach to a child process before giving up on it. Freshly spawned Python
+/// How often we try to attach to a process before giving up on it. Freshly spawned Python
 /// processes might not have initialized their interpreter yet, so the first attempts can fail.
 const MAX_ATTACH_ATTEMPTS: u32 = 5;
 
@@ -18,16 +18,18 @@ pub enum PySpyError {
     },
 }
 
+/// Captures the Python stacks of the processes it is told about. Finding the processes is up to
+/// the caller, so processes we cannot attach to are still known.
 pub struct SpyHelper {
     spies: HashMap<py_spy::Pid, PythonSpy>,
-    /// Child processes we could not attach to, with the number of failed attempts
-    failed_attaches: HashMap<py_spy::Pid, u32>,
+    /// Processes we could not attach to, with the number of failed attempts and the last error
+    failed_attaches: HashMap<py_spy::Pid, (u32, String)>,
     py_spy_config: Config,
 }
 
 impl SpyHelper {
-    pub fn new(root: py_spy::Pid, native_capture: NativeCapture) -> Result<Self, PySpyError> {
-        let mut helper = Self {
+    pub fn new(native_capture: NativeCapture) -> Self {
+        Self {
             spies: HashMap::new(),
             failed_attaches: HashMap::new(),
             py_spy_config: Config {
@@ -35,69 +37,58 @@ impl SpyHelper {
                 native_all: native_capture.everything(),
                 ..Default::default()
             },
-        };
-        helper.track_process(root)?;
-
-        Ok(helper)
+        }
     }
 
-    pub fn any_live(&self) -> bool {
-        !self.spies.is_empty()
-    }
+    /// Attaches to processes in `pids` we are not attached to yet and forgets all others.
+    pub fn sync(&mut self, pids: &HashSet<py_spy::Pid>) {
+        self.spies.retain(|pid, _| pids.contains(pid));
+        self.failed_attaches.retain(|pid, _| pids.contains(pid));
 
-    pub fn refresh(&mut self) {
-        let mut to_remove = Vec::new();
-        let mut new_processes = Vec::new();
-
-        for spy in self.spies.values() {
-            if let Ok(children) = spy.process.child_processes() {
-                for (child, _) in children {
-                    if self.spies.contains_key(&child) {
-                        continue;
-                    }
-                    let attempts = self.failed_attaches.get(&child).copied().unwrap_or(0);
-                    if attempts >= MAX_ATTACH_ATTEMPTS {
-                        continue;
-                    }
-                    new_processes.push(child);
-                }
-            }
-            if let Err(e) = spy.process.exe() {
-                info!("Tracked process exited: {e}");
-                to_remove.push(spy.pid);
-            }
-        }
-
-        // Clean up exited processes
-        for pid in to_remove {
-            self.spies.remove(&pid);
-        }
-
-        // Add new processes
+        let mut new_processes = pids
+            .iter()
+            .filter(|pid| !self.spies.contains_key(pid))
+            .filter(|pid| {
+                self.failed_attaches
+                    .get(pid)
+                    .is_none_or(|(attempts, _)| *attempts < MAX_ATTACH_ATTEMPTS)
+            })
+            .copied()
+            .collect::<Vec<_>>();
         new_processes.sort_unstable();
-        new_processes.dedup();
+
         for pid in new_processes {
             match self.track_process(pid) {
                 Ok(()) => {
                     self.failed_attaches.remove(&pid);
-                    info!("Tracking new process {pid}");
+                    info!("Attached to process {pid}");
                 }
                 Err(e) => {
-                    let attempts = self.failed_attaches.entry(pid).or_insert(0);
+                    let (attempts, error) = self
+                        .failed_attaches
+                        .entry(pid)
+                        .or_insert((0, String::new()));
                     *attempts += 1;
+                    *error = format!("{:#}", snafu::Report::from_error(&e));
                     if *attempts >= MAX_ATTACH_ATTEMPTS {
                         warn!(
-                            "Giving up on process {pid} after {attempts} attempts, \
-                            it is probably not a Python process: {e}"
+                            "Giving up on capturing stacks of process {pid} after {attempts} \
+                            attempts, it is probably not a Python process: {e}"
                         );
                     } else {
-                        debug!("Error tracking process {pid} (attempt {attempts}): {e}");
+                        debug!("Error attaching to process {pid} (attempt {attempts}): {e}");
                     }
                 }
             }
         }
 
-        debug!("Tracking {} processes", self.spies.len());
+        debug!("Attached to {} processes", self.spies.len());
+    }
+
+    /// Forgets a process, e.g. because its pid now belongs to a different process.
+    pub fn forget(&mut self, pid: py_spy::Pid) {
+        self.spies.remove(&pid);
+        self.failed_attaches.remove(&pid);
     }
 
     fn track_process(&mut self, pid: py_spy::Pid) -> Result<(), PySpyError> {
@@ -108,17 +99,29 @@ impl SpyHelper {
         Ok(())
     }
 
-    /// Captures the stacktraces of all tracked processes. A failed capture is returned as an
-    /// error message, so callers can still record the other data for that process.
-    pub fn get_stacktraces(&mut self) -> HashMap<py_spy::Pid, Result<Vec<StackTrace>, String>> {
+    /// Captures the stacktraces of all given processes. A failed capture is returned as an error
+    /// message, so callers can still record the other data for that process.
+    pub fn get_stacktraces(
+        &mut self,
+        pids: impl Iterator<Item = py_spy::Pid>,
+    ) -> HashMap<py_spy::Pid, Result<Vec<StackTrace>, String>> {
         let mut all_traces = HashMap::new();
 
-        for spy in self.spies.values_mut() {
-            let process_traces = spy.get_stack_traces().map_err(|e| {
-                info!("Sample error {}: {:?}", spy.pid, e);
-                format!("{e:#}")
-            });
-            all_traces.insert(spy.pid, process_traces);
+        for pid in pids {
+            let traces = match self.spies.get_mut(&pid) {
+                Some(spy) => spy.get_stack_traces().map_err(|e| {
+                    info!("Sample error {pid}: {e:?}");
+                    format!("{e:#}")
+                }),
+                None => Err(match self.failed_attaches.get(&pid) {
+                    Some((attempts, error)) if *attempts >= MAX_ATTACH_ATTEMPTS => {
+                        format!("Not a Python process: {error}")
+                    }
+                    Some((_, error)) => format!("Not attached yet: {error}"),
+                    None => "Not attached".to_string(),
+                }),
+            };
+            all_traces.insert(pid, traces);
         }
 
         all_traces

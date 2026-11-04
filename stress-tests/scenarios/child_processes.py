@@ -1,8 +1,7 @@
 """Child processes that are not direct Python children of a Python process.
 
 Shows: a Python grandchild started through a shell is still found and profiled. A non-Python child
-is invisible in the per-process data (py-spy cannot attach to it), so its CPU usage only shows up in
-the global graph.
+has no stacks, as py-spy cannot attach to it, but its resources are still recorded.
 """
 
 import json
@@ -21,7 +20,7 @@ with truth.phase("idle", checks=[{"type": "cpu"}]):
 
 with truth.phase(
     "non-Python child `yes > /dev/null`",
-    checks=[{"type": "untracked_process"}, {"type": "global_cpu_delta", "baseline": "idle"}],
+    checks=[{"type": "child_cpu"}, {"type": "global_cpu_delta", "baseline": "idle"}],
 ) as phase:
     child = subprocess.Popen(["yes"], stdout=subprocess.DEVNULL)
     time.sleep(4)

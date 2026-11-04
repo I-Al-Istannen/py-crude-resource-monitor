@@ -628,6 +628,7 @@ mod tests {
         JsonLine {
             stacktraces,
             stacktrace_error: None,
+            process: None,
             resources: ProcessResources {
                 memory: 1024,
                 cpu: 50.0,

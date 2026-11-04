@@ -1,11 +1,11 @@
 use crate::resources::SystemMeasurements;
-use crate::stacktraces::{PySpyError, SpyHelper};
-use crate::types::{JsonLine, NativeCapture, ProcessResources};
-use log::{trace, warn};
+use crate::stacktraces::SpyHelper;
+use crate::types::{JsonLine, NativeCapture, ProcessMetadata, ProcessResources};
+use log::{info, trace};
 use py_spy::StackTrace;
 use snafu::{Location, ResultExt, Snafu};
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -15,9 +15,9 @@ use sync::mpsc;
 
 #[derive(Debug, Snafu)]
 pub enum TrackerError {
-    #[snafu(display("Error coming from py-spy at {location}"))]
-    PySpy {
-        source: PySpyError,
+    #[snafu(display("Could not find process {pid} at {location}"))]
+    ProcessNotFound {
+        pid: u32,
         #[snafu(implicit)]
         location: Location,
     },
@@ -51,12 +51,15 @@ pub enum TrackerError {
 struct WriteRequest {
     output_path: PathBuf,
     resources: ProcessResources,
+    process: Option<ProcessMetadata>,
     stacktraces: Vec<StackTrace>,
     stacktrace_error: Option<String>,
     time: u128,
 }
 
 pub struct Tracker {
+    /// The root process and its descendants that were alive during the last tick
+    processes: HashMap<sysinfo::Pid, ProcessMetadata>,
     spies: SpyHelper,
     system: SystemMeasurements,
     output_dir: PathBuf,
@@ -65,39 +68,25 @@ pub struct Tracker {
 }
 
 impl Tracker {
-    pub fn new_with_retry(
+    pub fn new(
         pid: u32,
         output_dir: PathBuf,
         native_capture: NativeCapture,
     ) -> Result<Self, TrackerError> {
-        let mut last_err = None;
-        for _ in 0..5 {
-            match Self::new(pid, output_dir.clone(), native_capture) {
-                Ok(tracker) => return Ok(tracker),
-                Err(e) => {
-                    warn!("Got error during attach, will retry. ({e})");
-                    last_err = Some(e);
-                }
-            }
-            thread::sleep(std::time::Duration::from_secs(1));
+        let mut system = SystemMeasurements::new().context(SystemMeasurementsSnafu)?;
+        system.refresh();
+        let processes = system.process_tree([(sysinfo::Pid::from_u32(pid), None)]);
+        if processes.is_empty() {
+            return ProcessNotFoundSnafu { pid }.fail();
         }
-        Err(last_err.unwrap())
-    }
-
-    fn new(
-        pid: u32,
-        output_dir: PathBuf,
-        native_capture: NativeCapture,
-    ) -> Result<Self, TrackerError> {
-        let system = SystemMeasurements::new().context(SystemMeasurementsSnafu)?;
-        let spy_helper = SpyHelper::new(pid as py_spy::Pid, native_capture).context(PySpySnafu)?;
 
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(100);
 
         let writer_thread = thread::spawn(move || write_samples(rx));
 
         Ok(Self {
-            spies: spy_helper,
+            processes,
+            spies: SpyHelper::new(native_capture),
             system,
             output_dir,
             writer_channel: tx,
@@ -106,25 +95,31 @@ impl Tracker {
     }
 
     pub fn is_still_tracking(&self) -> bool {
-        self.spies.any_live()
+        !self.processes.is_empty()
     }
 
     pub fn tick(&mut self) -> Result<(), TrackerError> {
         self.system.refresh();
-        self.spies.refresh();
+        let new_processes = self.update_processes();
 
         let query_time = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_millis();
 
-        for (pid, traces) in self.spies.get_stacktraces() {
+        let mut traces = self
+            .spies
+            .get_stacktraces(self.processes.keys().map(|pid| pid.as_u32() as py_spy::Pid));
+        for (pid, metadata) in &self.processes {
             let Some(info) = self
                 .system
-                .get_process_info(sysinfo::Pid::from_u32(pid as u32))
+                .get_process_info(*pid, new_processes.contains(pid))
             else {
                 continue;
             };
+            let traces = traces
+                .remove(&(pid.as_u32() as py_spy::Pid))
+                .unwrap_or_else(|| Err("Not attached".to_string()));
 
             // Record the resources even if the stack capture failed, so the graph has no gaps
             let (stacktraces, stacktrace_error) = match traces {
@@ -134,6 +129,7 @@ impl Tracker {
             self.send(WriteRequest {
                 output_path: self.output_dir.join(format!("{pid}.json")),
                 resources: info,
+                process: Some(metadata.clone()),
                 stacktraces,
                 stacktrace_error,
                 time: query_time,
@@ -144,10 +140,51 @@ impl Tracker {
         self.send(WriteRequest {
             output_path: self.output_dir.join("global.json"),
             resources: global_resources,
+            process: None,
             stacktraces: vec![],
             stacktrace_error: None,
             time: query_time,
         })
+    }
+
+    /// Updates the tracked processes to the ones still alive and their descendants.
+    /// Returns the processes that were not alive during the previous tick.
+    fn update_processes(&mut self) -> HashSet<sysinfo::Pid> {
+        let current = self.system.process_tree(
+            self.processes
+                .iter()
+                .map(|(pid, metadata)| (*pid, Some(metadata.start_time))),
+        );
+
+        let mut new_processes = HashSet::new();
+        for (pid, metadata) in &current {
+            match self.processes.get(pid) {
+                Some(previous) if previous.start_time == metadata.start_time => {}
+                previous => {
+                    if previous.is_some() {
+                        // The pid was reused, we must not keep using the old spy
+                        self.spies.forget(pid.as_u32() as py_spy::Pid);
+                    }
+                    info!("Tracking new process {pid} ({})", metadata.name);
+                    new_processes.insert(*pid);
+                }
+            }
+        }
+        for pid in self.processes.keys() {
+            if !current.contains_key(pid) {
+                info!("Tracked process {pid} exited");
+            }
+        }
+
+        self.spies.sync(
+            &current
+                .keys()
+                .map(|pid| pid.as_u32() as py_spy::Pid)
+                .collect(),
+        );
+        self.processes = current;
+
+        new_processes
     }
 
     /// Queues a sample for writing. If this fails, the writer thread has stopped and [`Self::finish`]
@@ -202,6 +239,7 @@ fn write_samples(rx: mpsc::Receiver<WriteRequest>) -> Result<(), TrackerError> {
             stacktraces: req.stacktraces.into_iter().map(|s| s.into()).collect(),
             stacktrace_error: req.stacktrace_error,
             resources: req.resources,
+            process: req.process,
             index: *line_index,
             time: req.time,
         };

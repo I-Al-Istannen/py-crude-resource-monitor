@@ -287,7 +287,7 @@ fn run_profile(
     info!("Monitoring process with PID {pid}");
 
     let mut tracker =
-        Tracker::new_with_retry(pid, output_dir.clone(), native_capture).context(TrackerSnafu)?;
+        Tracker::new(pid, output_dir.clone(), native_capture).context(TrackerSnafu)?;
     info!("Tracking started");
     let mut next_tick = Instant::now();
     let mut tick_result = Ok(());
