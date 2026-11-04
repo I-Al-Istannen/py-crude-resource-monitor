@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{env, thread};
 
 const CLAP_STYLE: Styles = Styles::styled()
@@ -277,13 +277,22 @@ fn run_profile(
     let mut tracker =
         Tracker::new_with_retry(pid, output_dir.clone(), native_capture).context(TrackerSnafu)?;
     info!("Tracking started");
+    let mut next_tick = Instant::now();
     let mut tick_result = Ok(());
     while tracker.is_still_tracking() && !quit_requested.load(Ordering::Acquire) {
         tick_result = tracker.tick();
         if tick_result.is_err() {
             break;
         }
-        thread::sleep(sample_sleep_duration);
+        // Sleep until the next scheduled tick, so the time a tick takes doesn't add up over time.
+        // If we fall behind, we skip the missed ticks instead of sampling in a burst.
+        next_tick += sample_sleep_duration;
+        let now = Instant::now();
+        if next_tick < now {
+            next_tick = now;
+        } else {
+            thread::sleep(next_tick - now);
+        }
     }
     // Wait for all samples to be written. If the writer failed, its error is the root cause of a
     // failed tick, so we report that first.
