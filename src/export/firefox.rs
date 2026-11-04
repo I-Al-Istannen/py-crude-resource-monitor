@@ -8,7 +8,7 @@ use fxprof_processed_profile::{
     ReferenceTimestamp, SamplingInterval, StaticSchemaMarker, StaticSchemaMarkerField,
     StringHandle, ThreadHandle, Timestamp,
 };
-use log::info;
+use log::{info, warn};
 use snafu::{Location, OptionExt, ResultExt, Snafu, Whatever};
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -66,12 +66,14 @@ struct ProfileBuilder {
     category_native: CategoryHandle,
     category_python: CategoryHandle,
     include_bandwidth: bool,
+    memory: MemoryMetric,
 }
 
 impl ProfileBuilder {
     pub fn from_samples<'a, T: Iterator<Item = &'a Vec<JsonLine>>>(
         samples: impl Fn() -> T,
         include_bandwidth: bool,
+        memory: MemoryMetric,
     ) -> Result<Self, Whatever> {
         let start_time_millis = Self::start_time(samples().flat_map(|lines| lines.iter()))?;
         let interval_millis = Self::sampling_interval(samples())?;
@@ -80,6 +82,7 @@ impl ProfileBuilder {
             start_time_millis,
             interval_millis,
             include_bandwidth,
+            memory,
         ))
     }
 
@@ -114,7 +117,12 @@ impl ProfileBuilder {
             .whatever_context("no samples found")
     }
 
-    pub fn new(start_time_millis: u128, interval_millis: u64, include_bandwidth: bool) -> Self {
+    pub fn new(
+        start_time_millis: u128,
+        interval_millis: u64,
+        include_bandwidth: bool,
+        memory: MemoryMetric,
+    ) -> Self {
         let mut profile = Profile::new(
             // TODO: Add metadata to original data json files
             "python",
@@ -132,6 +140,7 @@ impl ProfileBuilder {
             category_native,
             category_python,
             include_bandwidth,
+            memory,
         }
     }
 
@@ -314,7 +323,10 @@ impl<'a> ProfileBuilderProcess<'a> {
             process,
             "malloc",
             "Memory",
-            "Amount of allocated memory",
+            match parent.memory {
+                MemoryMetric::Rss => "Resident set size (RSS)",
+                MemoryMetric::Pss => "Proportional set size (PSS)",
+            },
             GraphColor::Orange,
         )
         .initialize(&mut parent.profile, start_timestamp, 0.);
@@ -536,8 +548,13 @@ impl<'a> ProfileBuilderProcess<'a> {
     }
 
     fn add_counter_values(&mut self, timestamp: Timestamp, resources: &ProcessResources) {
+        let memory = match self.parent.memory {
+            MemoryMetric::Rss => resources.memory,
+            // The global data has no PSS, and processes might not have it for every sample
+            MemoryMetric::Pss => resources.pss.unwrap_or(resources.memory),
+        };
         self.memory_counter
-            .add_value(&mut self.parent.profile, timestamp, resources.memory as f64);
+            .add_value(&mut self.parent.profile, timestamp, memory as f64);
         if let Some(io_counter) = self.io_counter.as_mut() {
             io_counter.add_value(
                 &mut self.parent.profile,
@@ -547,8 +564,11 @@ impl<'a> ProfileBuilderProcess<'a> {
         }
     }
 
-    /// Adds the memory measured between two samples
+    /// Adds the memory measured between two samples. They only contain the RSS.
     fn add_memory_samples(&mut self, samples: &[MemorySample]) {
+        if self.parent.memory != MemoryMetric::Rss {
+            return;
+        }
         for sample in samples {
             let timestamp = self.time(sample.time);
             self.memory_counter.add_value(
@@ -719,10 +739,22 @@ pub struct FirefoxExportArguments {
     /// track. Recreated worker pools otherwise get a track per process.
     #[arg(long, value_enum, default_value_t = ProcessLanes::Auto)]
     lanes: ProcessLanes,
+    /// Which memory the memory graphs show
+    #[arg(long, value_enum, default_value_t = MemoryMetric::Rss)]
+    memory: MemoryMetric,
     /// The directory containing the profile data
     data_dir: PathBuf,
     /// The output file to write the gz-compressed JSON to
     output_file: PathBuf,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryMetric {
+    /// Resident set size, including the memory measured in between samples
+    Rss,
+    /// Proportional set size, if recorded with `profile --pss`. Memory shared between processes is
+    /// split between them, so the graphs add up. Also adds a track with the total of all processes.
+    Pss,
 }
 
 /// More processes than this are packed into lanes by default
@@ -864,7 +896,8 @@ fn generate_fxprof(
     processes: HashMap<ReportIdentifier, Vec<JsonLine>>,
     args: &FirefoxExportArguments,
 ) -> Result<Profile, Whatever> {
-    let mut builder = ProfileBuilder::from_samples(|| processes.values(), args.bandwidth)?;
+    let mut builder =
+        ProfileBuilder::from_samples(|| processes.values(), args.bandwidth, args.memory)?;
     let end_millis = processes.values().flatten().map(|it| it.time).max();
     let duration_millis = end_millis.unwrap_or_default() - builder.start_time_millis;
 
@@ -887,7 +920,14 @@ fn generate_fxprof(
             ReportIdentifier::Global => builder.add_global(samples)?,
         }
     }
-    builder.add_pss_total(pss_totals);
+    if args.memory == MemoryMetric::Pss {
+        if pss_totals.is_empty() {
+            warn!(
+                "The profile contains no PSS, showing RSS instead. Record it with `profile --pss`"
+            );
+        }
+        builder.add_pss_total(pss_totals);
+    }
     // Ensure the report is deterministic
     instances.sort_by_key(|it| (it.start(), it.pid));
 
@@ -993,6 +1033,7 @@ mod tests {
         FirefoxExportArguments {
             bandwidth: true,
             lanes: ProcessLanes::Never,
+            memory: MemoryMetric::Rss,
             data_dir: PathBuf::new(),
             output_file: PathBuf::new(),
         }
@@ -1131,11 +1172,20 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let json = processes_json(HashMap::from([
+        let processes = HashMap::from([
             (ReportIdentifier::Pid(1), process(&[100, 300])),
             (ReportIdentifier::Pid(2), process(&[50])),
-        ]));
+        ]);
+        let args = FirefoxExportArguments {
+            memory: MemoryMetric::Pss,
+            ..args()
+        };
+        let json = serde_json::to_value(generate_fxprof(processes, &args).unwrap()).unwrap();
 
+        assert_eq!(
+            memory_graph(&json, 1),
+            [(0.0, 0.0), (0.0, 100.0), (100.0, 300.0)]
+        );
         assert_eq!(
             memory_graph(&json, PSS_TOTAL_PID),
             [(0.0, 0.0), (0.0, 150.0), (100.0, 300.0)]
@@ -1143,12 +1193,21 @@ mod tests {
     }
 
     #[test]
-    fn adds_no_pss_track_without_pss() {
-        let json = processes_json(HashMap::from([(
-            ReportIdentifier::Pid(1),
-            vec![line(1000, vec![], &[]), line(1100, vec![], &[])],
-        )]));
+    fn shows_rss_and_no_pss_track_by_default() {
+        let samples = (0..2)
+            .map(|i| {
+                let mut line = line(1000 + i * 100, vec![], &[]);
+                line.resources.pss = Some(1);
+                line
+            })
+            .collect();
+        let json = processes_json(HashMap::from([(ReportIdentifier::Pid(1), samples)]));
         let pss_total_pid = PSS_TOTAL_PID.to_string();
+
+        assert_eq!(
+            memory_graph(&json, 1),
+            [(0.0, 0.0), (0.0, 1024.0), (100.0, 1024.0)]
+        );
 
         assert!(
             json["counters"]
