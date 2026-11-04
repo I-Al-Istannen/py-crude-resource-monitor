@@ -4,8 +4,8 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use fxprof_processed_profile::{
     CategoryColor, CategoryHandle, CounterHandle, CpuDelta, Frame, FrameFlags, FrameInfo,
-    GraphColor, MarkerFieldFlags, MarkerFieldFormat, MarkerTiming, ProcessHandle, Profile,
-    ReferenceTimestamp, SamplingInterval, StaticSchemaMarker, StaticSchemaMarkerField,
+    GraphColor, MarkerFieldFlags, MarkerFieldFormat, MarkerLocations, MarkerTiming, ProcessHandle,
+    Profile, ReferenceTimestamp, SamplingInterval, StaticSchemaMarker, StaticSchemaMarkerField,
     StringHandle, ThreadHandle, Timestamp,
 };
 use log::{info, warn};
@@ -159,6 +159,8 @@ impl ProfileBuilder {
         let (start, end) = (first_sample.time, samples.last().unwrap().time);
 
         let mut process = ProfileBuilderProcess::new(self, "Global", 0, start, false);
+        // Every tick writes a global sample, so gaps in them are ticks the profiler skipped
+        process.add_skipped_ticks_markers(&samples);
         // Global CPU is meant to be divided by the number of cores, 100% means all cores are busy
         process.add_label_samples("Global", samples, |line| line.resources.cpu);
         process.finish(end);
@@ -202,18 +204,15 @@ impl ProfileBuilder {
             1 => first.name().to_string(),
             count => format!("{} ({count} processes)", first.name()),
         };
-        let shared = lane.len() > 1;
-
         let mut process = ProfileBuilderProcess::new(self, &name, pid, start, pack_threads);
         let mut previous_end = None;
         for instance in lane {
-            if shared {
-                if let Some(previous_end) = previous_end {
-                    // Don't let the memory of the previous process linger until the next starts
-                    process.reset_counters((previous_end + instance.start()) / 2);
-                }
-                process.add_lifetime_marker(&instance);
+            if let Some(previous_end) = previous_end {
+                // Don't let the memory of the previous process linger until the next starts
+                process.reset_counters((previous_end + instance.start()) / 2);
             }
+            process.add_lifetime_marker(&instance);
+            process.add_stack_error_markers(&instance.samples);
             previous_end = Some(instance.end());
             process.add_instance(instance)?;
         }
@@ -595,7 +594,8 @@ impl<'a> ProfileBuilderProcess<'a> {
         );
     }
 
-    /// Marks when a process sharing this Firefox process was alive
+    /// Marks when a process was alive. This tells processes sharing a track apart, and lists all
+    /// processes with their start and exit in the marker table.
     fn add_lifetime_marker(&mut self, instance: &Instance) {
         let timing = MarkerTiming::Interval(self.time(instance.start()), self.time(instance.end()));
         let name = self.parent.profile.intern_string(instance.name());
@@ -609,6 +609,54 @@ impl<'a> ProfileBuilderProcess<'a> {
         );
     }
 
+    /// Marks consecutive samples whose stacks could not be captured for the same reason
+    fn add_stack_error_markers(&mut self, samples: &[JsonLine]) {
+        fn reason(line: &JsonLine) -> Option<&str> {
+            line.stacktrace_error.as_deref().map(error_reason)
+        }
+        for run in samples.chunk_by(|a, b| reason(a) == reason(b)) {
+            let (Some(reason), Some(details)) =
+                (reason(&run[0]), &run[run.len() - 1].stacktrace_error)
+            else {
+                continue;
+            };
+            let (start, end) = (run[0].time, run[run.len() - 1].time);
+            let timing = if start == end {
+                MarkerTiming::Instant(self.time(start))
+            } else {
+                MarkerTiming::Interval(self.time(start), self.time(end))
+            };
+            let marker = StackCaptureFailedMarker {
+                reason: self.parent.profile.intern_string(reason),
+                details: self.parent.profile.intern_string(details),
+            };
+            self.parent
+                .profile
+                .add_marker(self.main_thread, timing, marker);
+        }
+    }
+
+    /// Marks gaps of more than one and a half intervals between samples
+    fn add_skipped_ticks_markers(&mut self, samples: &[JsonLine]) {
+        let interval = self.parent.interval_millis.max(1) as u128;
+        for window in samples.windows(2) {
+            let (previous, next) = (window[0].time, window[1].time);
+            let gap = next.saturating_sub(previous);
+            if gap * 2 <= interval * 3 {
+                continue;
+            }
+            let timing = MarkerTiming::Interval(self.time(previous), self.time(next));
+            let skipped = ((gap + interval / 2) / interval).saturating_sub(1).max(1);
+            self.parent.profile.add_marker(
+                self.main_thread,
+                timing,
+                SkippedTicksMarker {
+                    skipped: skipped as u64,
+                },
+            );
+        }
+    }
+
     /// Ends the process and all its threads. Threads that were last seen earlier end then.
     fn finish(self, end_millis: u128) {
         let end = self.time(end_millis);
@@ -620,6 +668,23 @@ impl<'a> ProfileBuilderProcess<'a> {
                 profile.set_thread_end_time(thread, end);
             }
         }
+    }
+}
+
+/// The root cause of a stack capture error, the last line of its cause chain. Errors change while
+/// attaching is retried, e.g. from "Not attached yet: ..." to "Not a Python process: ...", but keep
+/// their root cause.
+fn error_reason(error: &str) -> &str {
+    let last_line = error
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(error);
+    // Causes are numbered, like `1: Failed to find python version`
+    match last_line.split_once(": ") {
+        Some((number, cause)) if number.parse::<u32>().is_ok() => cause,
+        _ => last_line,
     }
 }
 
@@ -841,7 +906,7 @@ fn normalize_thread_name(name: Option<&str>) -> String {
     normalized
 }
 
-/// Marks when a process that shares a track with others was alive
+/// Marks when a process was alive
 struct ProcessLifetimeMarker {
     name: StringHandle,
     pid: u32,
@@ -874,6 +939,97 @@ impl StaticSchemaMarker for ProcessLifetimeMarker {
 
     fn number_field_value(&self, _field_index: u32) -> f64 {
         self.pid as f64
+    }
+}
+
+/// Marks samples without stacks because capturing them failed. Their resources are still valid.
+struct StackCaptureFailedMarker {
+    reason: StringHandle,
+    details: StringHandle,
+}
+
+impl StaticSchemaMarker for StackCaptureFailedMarker {
+    const UNIQUE_MARKER_TYPE_NAME: &'static str = "StackCaptureFailed";
+    const DESCRIPTION: Option<&'static str> =
+        Some("The stacks of these samples could not be captured, only their resources");
+    const LOCATIONS: MarkerLocations = MarkerLocations::MARKER_CHART
+        .union(MarkerLocations::MARKER_TABLE)
+        .union(MarkerLocations::TIMELINE_OVERVIEW);
+    const CHART_LABEL: Option<&'static str> = Some("{marker.data.reason}");
+    const TOOLTIP_LABEL: Option<&'static str> = Some("Stack capture failed: {marker.data.reason}");
+    const TABLE_LABEL: Option<&'static str> = Some("{marker.data.reason}");
+    const FIELDS: &'static [StaticSchemaMarkerField] = &[
+        StaticSchemaMarkerField {
+            key: "reason",
+            label: "Reason",
+            format: MarkerFieldFormat::String,
+            flags: MarkerFieldFlags::SEARCHABLE,
+        },
+        StaticSchemaMarkerField {
+            key: "details",
+            label: "Last error",
+            format: MarkerFieldFormat::String,
+            flags: MarkerFieldFlags::empty(),
+        },
+    ];
+
+    fn name(&self, profile: &mut Profile) -> StringHandle {
+        profile.intern_string("Stack capture failed")
+    }
+
+    fn category(&self, _profile: &mut Profile) -> CategoryHandle {
+        CategoryHandle::OTHER
+    }
+
+    fn string_field_value(&self, field_index: u32) -> StringHandle {
+        match field_index {
+            0 => self.reason,
+            _ => self.details,
+        }
+    }
+
+    fn number_field_value(&self, _field_index: u32) -> f64 {
+        unreachable!("the marker has no number fields")
+    }
+}
+
+/// Marks samples the profiler skipped because it fell behind, e.g. because capturing the stacks
+/// took longer than the interval
+struct SkippedTicksMarker {
+    skipped: u64,
+}
+
+impl StaticSchemaMarker for SkippedTicksMarker {
+    const UNIQUE_MARKER_TYPE_NAME: &'static str = "SkippedTicks";
+    const DESCRIPTION: Option<&'static str> =
+        Some("The profiler fell behind and took no samples in this range");
+    const LOCATIONS: MarkerLocations = MarkerLocations::MARKER_CHART
+        .union(MarkerLocations::MARKER_TABLE)
+        .union(MarkerLocations::TIMELINE_OVERVIEW);
+    const CHART_LABEL: Option<&'static str> = Some("{marker.data.skipped}");
+    const TOOLTIP_LABEL: Option<&'static str> = Some("Skipped {marker.data.skipped} samples");
+    const TABLE_LABEL: Option<&'static str> = Some("Skipped {marker.data.skipped} samples");
+    const FIELDS: &'static [StaticSchemaMarkerField] = &[StaticSchemaMarkerField {
+        key: "skipped",
+        label: "Skipped samples",
+        format: MarkerFieldFormat::Integer,
+        flags: MarkerFieldFlags::empty(),
+    }];
+
+    fn name(&self, profile: &mut Profile) -> StringHandle {
+        profile.intern_string("Skipped samples")
+    }
+
+    fn category(&self, _profile: &mut Profile) -> CategoryHandle {
+        CategoryHandle::OTHER
+    }
+
+    fn string_field_value(&self, _field_index: u32) -> StringHandle {
+        unreachable!("the marker has no string fields")
+    }
+
+    fn number_field_value(&self, _field_index: u32) -> f64 {
+        self.skipped as f64
     }
 }
 
@@ -1371,7 +1527,8 @@ mod tests {
             .iter()
             .map(|t| t["markers"]["length"].as_u64().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(markers.iter().sum::<u64>(), 6);
+        // One per worker, and one for the root
+        assert_eq!(markers.iter().sum::<u64>(), 7);
     }
 
     #[test]
@@ -1400,6 +1557,104 @@ mod tests {
 
         // Pool-1_0 and Pool-2_0 share a thread, Pool-2_1 runs at the same time as Pool-2_0
         assert_eq!(thread_names(&json), ["Pool-#_#", "Pool-#_#", "python"]);
+    }
+
+    /// The markers of the thread named `thread` as (name, start, end, data). Instant markers have
+    /// no end, string fields are resolved.
+    fn markers(
+        json: &serde_json::Value,
+        thread: &str,
+    ) -> Vec<(String, f64, Option<f64>, serde_json::Value)> {
+        let thread = json["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == thread)
+            .unwrap();
+        let strings = thread["stringArray"].as_array().unwrap();
+        let markers = &thread["markers"];
+        (0..markers["length"].as_u64().unwrap() as usize)
+            .map(|i| {
+                let name = strings[markers["name"][i].as_u64().unwrap() as usize]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let instant = markers["phase"][i] == 0;
+                let mut data = markers["data"][i].clone();
+                for field in ["reason", "details"] {
+                    if let Some(value) = data.get_mut(field) {
+                        *value = strings[value.as_u64().unwrap() as usize].clone();
+                    }
+                }
+                (
+                    name,
+                    markers["startTime"][i].as_f64().unwrap(),
+                    markers["endTime"][i].as_f64().filter(|_| !instant),
+                    data,
+                )
+            })
+            .collect()
+    }
+
+    const NOT_PYTHON: &str = "Error creating py-spy at src/stacktraces.rs:95:60\n\nCaused by this error:\n  1: Failed to find python version from target process\n";
+
+    #[test]
+    fn marks_failed_stack_captures() {
+        let samples = (0..5)
+            .map(|i| {
+                let mut line = line(1000 + i * 100, vec![], &[]);
+                line.process = Some(metadata("python", 1));
+                line.stacktrace_error = match i {
+                    0 => Some("Timed out".to_string()),
+                    1 => None,
+                    // Retrying changes the message, but not the cause
+                    2 => Some(format!("Not attached yet: {NOT_PYTHON}")),
+                    _ => Some(format!("Not a Python process: {NOT_PYTHON}")),
+                };
+                line
+            })
+            .collect();
+        let json = processes_json(HashMap::from([(ReportIdentifier::Pid(1), samples)]));
+
+        let failed = markers(&json, "python")
+            .into_iter()
+            .filter(|(name, ..)| name == "Stack capture failed")
+            .map(|(_, start, end, data)| (start, end, data["reason"].clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            failed,
+            [
+                (0.0, None, serde_json::json!("Timed out")),
+                (
+                    200.0,
+                    Some(400.0),
+                    serde_json::json!("Failed to find python version from target process")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn marks_skipped_ticks_in_the_global_track() {
+        let samples = [1000, 1100, 1200, 1500, 1600, 1700]
+            .into_iter()
+            .map(|time| line(time, vec![], &[]))
+            .collect();
+        let json = processes_json(HashMap::from([(ReportIdentifier::Global, samples)]));
+
+        let skipped = markers(&json, "Global")
+            .into_iter()
+            .map(|(name, start, end, data)| (name, start, end, data["skipped"].clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            skipped,
+            [(
+                "Skipped samples".to_string(),
+                200.0,
+                Some(500.0),
+                serde_json::json!(2.0)
+            )]
+        );
     }
 
     #[test]
