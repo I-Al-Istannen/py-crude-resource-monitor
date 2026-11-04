@@ -141,9 +141,6 @@ def check_cpu(profile, truth, phase, check):
 def check_thread_cpu(profile, truth, phase, check):
     expected, measured, status = [], [], PASS
     for thread in phase["threads"]:
-        if thread["native_id"] == phase["pid"]:
-            # sysinfo does not list the main thread as a task of its process, so there is no data
-            continue
         samples = profile.window(phase["pid"], thread["start"], thread["end"])
         values = [v for s in samples if (v := profile.thread_cores(s, thread["native_id"])) is not None]
         truth_cores = thread["cpu_seconds"] / duration_seconds(thread)

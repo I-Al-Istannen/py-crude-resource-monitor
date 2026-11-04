@@ -27,7 +27,12 @@ pub struct ThreadResources {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessResources {
     pub memory: u64,
+    /// Divided by the number of cores, so 100% means all cores are fully used
     pub cpu: f32,
+    /// The number of cores `cpu` was divided by. Missing in the global data and in profiles
+    /// written by older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u32>,
     pub disk_read_bytes: u64,
     pub disk_write_bytes: u64,
     pub thread_resources: HashMap<u64, ThreadResources>,
@@ -199,6 +204,7 @@ mod tests {
             resources: ProcessResources {
                 memory: 1,
                 cpu: 2.0,
+                cpus: None,
                 disk_read_bytes: 0,
                 disk_write_bytes: 0,
                 thread_resources: HashMap::new(),

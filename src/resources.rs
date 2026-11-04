@@ -40,10 +40,12 @@ impl SystemMeasurements {
         let process = self.system.process(pid)?;
 
         // Normalize cpu usage to number of cores, as firefox profiler can only render up to 100%
-        let cpu_usage = process.cpu_usage() / (self.system.cpus().len().max(1) as f32);
+        let cpus = self.system.cpus().len().max(1) as u32;
+        let cpu_usage = process.cpu_usage() / cpus as f32;
         let memory = process.memory();
+        let disk_usage = process.disk_usage();
 
-        let thread_resources = process
+        let mut thread_resources = process
             .tasks()
             .into_iter()
             .flatten()
@@ -61,11 +63,29 @@ impl SystemMeasurements {
             })
             .collect::<HashMap<u64, _>>();
 
+        // sysinfo leaves the main thread (tid == pid) out of the tasks, so we attribute
+        // everything the other threads did not use to it.
+        if process.tasks().is_some() {
+            let others = thread_resources.values();
+            let main_thread = ThreadResources {
+                cpu: (process.cpu_usage() - others.clone().map(|it| it.cpu).sum::<f32>()).max(0.0),
+                memory,
+                disk_read_bytes: disk_usage
+                    .read_bytes
+                    .saturating_sub(others.clone().map(|it| it.disk_read_bytes).sum()),
+                disk_write_bytes: disk_usage
+                    .written_bytes
+                    .saturating_sub(others.map(|it| it.disk_write_bytes).sum()),
+            };
+            thread_resources.insert(pid.as_u32() as u64, main_thread);
+        }
+
         Some(ProcessResources {
             memory,
             cpu: cpu_usage,
-            disk_read_bytes: process.disk_usage().read_bytes,
-            disk_write_bytes: process.disk_usage().written_bytes,
+            cpus: Some(cpus),
+            disk_read_bytes: disk_usage.read_bytes,
+            disk_write_bytes: disk_usage.written_bytes,
             thread_resources,
         })
     }
@@ -85,6 +105,7 @@ impl SystemMeasurements {
         ProcessResources {
             memory,
             cpu,
+            cpus: None,
             disk_read_bytes,
             disk_write_bytes,
             thread_resources: HashMap::new(),
