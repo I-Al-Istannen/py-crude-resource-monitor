@@ -8,6 +8,43 @@ on:
       - master
 
 jobs:
+  check:
+    name: Lint and Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install pkgconfig dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install libunwind-dev build-essential liblzma-dev -y
+          echo 'RUSTFLAGS=-C link-arg=-llzma' >> $GITHUB_ENV
+
+      - name: Test frontend
+        run: |
+          cd frontend
+          pnpm install --frozen-lockfile
+          pnpm test
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --features unwind -- -D warnings
+
+      - name: Test
+        run: cargo test --features unwind
+
   build:
     name: Build Binary (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -81,7 +118,7 @@ jobs:
         run: |
           # The musl build image has no node, so build.rs can't do this for us
           cd frontend
-          pnpm install
+          pnpm install --frozen-lockfile
           pnpm build
 
       - name: Build musl build image
