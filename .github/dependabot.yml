@@ -16,3 +16,11 @@ updates:
       rust-dependencies:
         patterns:
           - "*"
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: monthly
+    groups:
+      frontend-dependencies:
+        patterns:
+          - "*"
