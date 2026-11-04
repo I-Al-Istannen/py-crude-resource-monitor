@@ -1417,6 +1417,7 @@ dependencies = [
  "log",
  "mime_guess",
  "py-spy",
+ "remoteprocess",
  "rust-embed",
  "serde",
  "serde_json",
@@ -1588,7 +1589,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "remoteprocess"
 version = "0.5.5"
-source = "git+https://github.com/I-Al-Istannen/remoteprocess?rev=54b73488104237f41966967b488f10982ce5ef24#54b73488104237f41966967b488f10982ce5ef24"
+source = "git+https://github.com/I-Al-Istannen/remoteprocess?rev=f59ac5911851c38876afb83e5064614468659a61#f59ac5911851c38876afb83e5064614468659a61"
 dependencies = [
  "addr2line",
  "cfg-if",
