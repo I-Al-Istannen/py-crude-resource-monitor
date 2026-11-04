@@ -13,15 +13,17 @@ pub struct SystemMeasurements {
     last_refresh: Option<Instant>,
     /// Time between the last two refreshes
     refresh_interval: Option<Duration>,
+    record_pss: bool,
 }
 
 impl SystemMeasurements {
-    pub fn new() -> Result<Self, sysinfo::Error> {
+    pub fn new(record_pss: bool) -> Result<Self, sysinfo::Error> {
         Ok(Self {
             system: sysinfo::System::new()?,
             disk: sysinfo::Disks::new()?,
             last_refresh: None,
             refresh_interval: None,
+            record_pss,
         })
     }
 
@@ -162,6 +164,7 @@ impl SystemMeasurements {
 
         Some(ProcessResources {
             memory,
+            pss: self.record_pss.then(|| read_pss(pid)).flatten(),
             cpu: cpu_usage,
             cpus: Some(cpus),
             disk_read_bytes: disk_usage.read_bytes,
@@ -184,11 +187,49 @@ impl SystemMeasurements {
 
         ProcessResources {
             memory,
+            pss: None,
             cpu,
             cpus: None,
             disk_read_bytes,
             disk_write_bytes,
             thread_resources: HashMap::new(),
         }
+    }
+}
+
+/// Reads the proportional set size of a process. This walks all its pages, so it gets slow for
+/// processes with a lot of memory.
+#[cfg(target_os = "linux")]
+fn read_pss(pid: Pid) -> Option<u64> {
+    let rollup = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+    parse_pss(&rollup)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_pss(_pid: Pid) -> Option<u64> {
+    None
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_pss(rollup: &str) -> Option<u64> {
+    let line = rollup.lines().find(|it| it.starts_with("Pss:"))?;
+    let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    Some(kib * 1024)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_pss_from_smaps_rollup() {
+        let rollup = "\
+55d0c8a4e000-7ffd4b5f1000 ---p 00000000 00:00 0                          [rollup]
+Rss:              630352 kB
+Pss:              157776 kB
+Pss_Dirty:        154004 kB
+";
+
+        assert_eq!(parse_pss(rollup), Some(157776 * 1024));
     }
 }

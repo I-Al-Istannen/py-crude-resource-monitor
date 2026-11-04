@@ -1,4 +1,5 @@
 mod export;
+mod memory_sampler;
 mod resources;
 mod stacktraces;
 mod tracker;
@@ -61,6 +62,15 @@ enum Subcommands {
             short_alias = 's'
         )]
         interval: u64,
+        /// Milliseconds between memory measurements taken in between the samples, so short
+        /// allocation spikes are not missed. Only changes are stored. 0 disables them.
+        #[arg(long, value_name = "MS", default_value_t = 10)]
+        memory_interval: u64,
+        /// Also record the proportional set size (PSS) of every process, which splits memory
+        /// shared between processes, e.g. after a fork, between them. Linux only. Reading it takes
+        /// longer the more memory a process uses.
+        #[arg(long)]
+        pss: bool,
         /// Delete samples from a previous run in the output directory without asking
         #[arg(short, long)]
         yes: bool,
@@ -192,10 +202,23 @@ fn main() -> Result<(), ApplicationError> {
             pid,
             output_dir,
             interval,
+            memory_interval,
+            pss,
             yes,
             native,
             command,
-        } => run_profile(pid, command, output_dir, interval, yes, native)?,
+        } => run_profile(
+            pid,
+            command,
+            output_dir,
+            ProfileOptions {
+                interval_millis: interval,
+                memory_interval_millis: memory_interval,
+                record_pss: pss,
+                native_capture: native,
+            },
+            yes,
+        )?,
         Subcommands::View {
             output_dir,
             interface,
@@ -243,14 +266,26 @@ fn main() -> Result<(), ApplicationError> {
     Ok(())
 }
 
+struct ProfileOptions {
+    interval_millis: u64,
+    memory_interval_millis: u64,
+    record_pss: bool,
+    native_capture: NativeCapture,
+}
+
 fn run_profile(
     pid: Option<u32>,
     command: Option<Vec<String>>,
     output_dir: PathBuf,
-    interval_millis: u64,
+    options: ProfileOptions,
     skip_confirmation: bool,
-    native_capture: NativeCapture,
 ) -> Result<Option<ExitStatus>, ApplicationError> {
+    let ProfileOptions {
+        interval_millis,
+        memory_interval_millis,
+        record_pss,
+        native_capture,
+    } = options;
     #[cfg(target_os = "macos")]
     {
         // On macOS, we need to be root to profile processes
@@ -269,6 +304,12 @@ fn run_profile(
     }
 
     let sample_sleep_duration = Duration::from_millis(interval_millis);
+    // Measuring memory as often as the samples would add nothing
+    let memory_interval = (memory_interval_millis > 0 && memory_interval_millis < interval_millis)
+        .then(|| Duration::from_millis(memory_interval_millis));
+    if record_pss && !cfg!(target_os = "linux") {
+        warn!("PSS can only be recorded on Linux, ignoring `--pss`");
+    }
 
     std::fs::create_dir_all(&output_dir).context(DataDirCreateSnafu)?;
     clear_data_dir(&output_dir, skip_confirmation)?;
@@ -286,8 +327,14 @@ fn run_profile(
     let (pid, child) = start_profiling_target_if_necessary(pid, command)?;
     info!("Monitoring process with PID {pid}");
 
-    let mut tracker =
-        Tracker::new(pid, output_dir.clone(), native_capture).context(TrackerSnafu)?;
+    let mut tracker = Tracker::new(
+        pid,
+        output_dir.clone(),
+        native_capture,
+        record_pss,
+        memory_interval,
+    )
+    .context(TrackerSnafu)?;
     info!("Tracking started");
     let mut next_tick = Instant::now();
     let mut tick_result = Ok(());
