@@ -276,7 +276,7 @@ fn run_profile(
         );
     }
 
-    let (pid, _child) = start_profiling_target_if_necessary(pid, command)?;
+    let (pid, child) = start_profiling_target_if_necessary(pid, command)?;
     info!("Monitoring process with PID {pid}");
 
     let mut tracker =
@@ -307,11 +307,11 @@ fn run_profile(
     let exit_code = if quit_requested.load(Ordering::Acquire) {
         info!("Termination requested, exiting");
         // Explicitly kill the child now
-        drop(_child);
+        drop(child);
         None
     } else {
         info!("All processes have exited, exiting");
-        if let Some(mut child) = _child {
+        if let Some(mut child) = child {
             Some(child.0.wait().context(ChildWaitSnafu)?)
         } else {
             None
