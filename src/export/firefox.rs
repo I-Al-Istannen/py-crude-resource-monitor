@@ -454,8 +454,14 @@ impl ProfileBuilderProcess<'_, MainThreadAdded> {
                 let cpu_delta = match thread_resources {
                     Some(resources) => self.cpu(resources.cpu),
                     // Per-thread data is not available on all platforms, so we attribute the
-                    // whole process to the main thread as a fallback.
-                    None if thread == self.data.main_thread_handle => self.cpu(line.resources.cpu),
+                    // whole process to the main thread as a fallback. The process CPU is divided
+                    // by the number of cores, thread CPU is not.
+                    None if thread == self.data.main_thread_handle
+                        && line.resources.thread_resources.is_empty() =>
+                    {
+                        let cpus = line.resources.cpus.unwrap_or(1) as f32;
+                        self.cpu(line.resources.cpu * cpus)
+                    }
                     None => CpuDelta::ZERO,
                 };
                 self.parent
@@ -625,6 +631,7 @@ mod tests {
             resources: ProcessResources {
                 memory: 1024,
                 cpu: 50.0,
+                cpus: None,
                 disk_read_bytes: 0,
                 disk_write_bytes: 0,
                 thread_resources: thread_cpu
@@ -726,6 +733,54 @@ mod tests {
         assert_eq!(
             cpu_deltas("worker"),
             serde_json::json!([20000, 20000, 20000])
+        );
+    }
+
+    fn thread_cpu_deltas(
+        processes: HashMap<ReportIdentifier, Vec<JsonLine>>,
+        name: &str,
+    ) -> serde_json::Value {
+        let profile = generate_fxprof(processes, &args()).unwrap();
+        let json = serde_json::to_value(&profile).unwrap();
+        let thread = json["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap();
+        thread["samples"]["threadCPUDelta"].clone()
+    }
+
+    #[test]
+    fn main_thread_falls_back_to_undivided_process_cpu() {
+        // No per-thread data at all, like on macOS: 50% of 4 cores is two full cores
+        let samples = (0..3)
+            .map(|i| {
+                let mut line = line(1000 + i * 100, vec![stacktrace(1, MAIN_THREAD_NAME)], &[]);
+                line.resources.cpus = Some(4);
+                line
+            })
+            .collect();
+        let processes = HashMap::from([(ReportIdentifier::Pid(1), samples)]);
+
+        assert_eq!(
+            thread_cpu_deltas(processes, "Process"),
+            serde_json::json!([200000, 200000, 200000])
+        );
+    }
+
+    #[test]
+    fn main_thread_without_own_data_is_idle_if_other_threads_have_data() {
+        // Older profiles miss the main thread, the process CPU belongs to the worker
+        let threads = || vec![stacktrace(1, MAIN_THREAD_NAME), stacktrace(2, "worker")];
+        let samples = (0..3)
+            .map(|i| line(1000 + i * 100, threads(), &[(2, 100.0)]))
+            .collect();
+        let processes = HashMap::from([(ReportIdentifier::Pid(1), samples)]);
+
+        assert_eq!(
+            thread_cpu_deltas(processes, "Process"),
+            serde_json::json!([0, 0, 0])
         );
     }
 }
