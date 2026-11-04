@@ -64,13 +64,16 @@ struct ProfileBuilder {
     include_bandwidth: bool,
 }
 
+/// The default interval of `profile`
+const DEFAULT_INTERVAL_MILLIS: u64 = 1000;
+
 impl ProfileBuilder {
     pub fn from_samples<'a, T: Iterator<Item = &'a Vec<JsonLine>>>(
         samples: impl Fn() -> T,
         include_bandwidth: bool,
     ) -> Result<Self, Whatever> {
         let start_time_millis = Self::start_time(samples().flat_map(|lines| lines.iter()))?;
-        let interval_millis = Self::sampling_interval(samples().flat_map(|lines| lines.iter()))?;
+        let interval_millis = Self::sampling_interval(samples());
 
         Ok(Self::new(
             start_time_millis,
@@ -88,17 +91,16 @@ impl ProfileBuilder {
             .whatever_context("no samples found")
     }
 
-    pub fn sampling_interval(
-        samples: impl Iterator<Item = impl Borrow<JsonLine>>,
-    ) -> Result<u64, Whatever> {
-        let deltas = samples.collect::<Vec<_>>();
-        let mut deltas = deltas
-            .windows(2)
-            .map(|window| {
-                window[1]
-                    .borrow()
-                    .time
-                    .saturating_sub(window[0].borrow().time)
+    /// Estimates the sampling interval from the time between consecutive samples of each file.
+    /// Deltas are only taken within a file, as different files cover different time ranges. If no
+    /// file has two samples, e.g. because the profile ended after one tick, this is the default
+    /// interval of `profile`.
+    pub fn sampling_interval<'a>(samples: impl Iterator<Item = &'a Vec<JsonLine>>) -> u64 {
+        let mut deltas = samples
+            .flat_map(|lines| {
+                lines
+                    .windows(2)
+                    .map(|window| window[1].time.saturating_sub(window[0].time))
             })
             .collect::<Vec<_>>();
         deltas.sort_unstable();
@@ -106,9 +108,7 @@ impl ProfileBuilder {
         // take the median of the deltas as intended interval
         deltas
             .get(deltas.len() / 2)
-            .copied()
-            .map(|it| it as u64)
-            .whatever_context("no samples found")
+            .map_or(DEFAULT_INTERVAL_MILLIS, |it| *it as u64)
     }
 
     pub fn new(start_time_millis: u128, interval_millis: u64, include_bandwidth: bool) -> Self {
@@ -448,16 +448,15 @@ impl ProfileBuilderProcess<'_, MainThreadAdded> {
                     .profile
                     .intern_stack_frames(thread, stack_frames.into_iter());
 
-                let cpu_delta = if thread == self.data.main_thread_handle {
-                    self.cpu(line.resources.cpu)
-                } else if let Some(os_thread_id) = stacktrace.os_thread_id {
-                    if let Some(resources) = line.resources.thread_resources.get(&os_thread_id) {
-                        self.cpu(resources.cpu)
-                    } else {
-                        CpuDelta::ZERO
-                    }
-                } else {
-                    CpuDelta::ZERO
+                let thread_resources = stacktrace
+                    .os_thread_id
+                    .and_then(|id| line.resources.thread_resources.get(&id));
+                let cpu_delta = match thread_resources {
+                    Some(resources) => self.cpu(resources.cpu),
+                    // Per-thread data is not available on all platforms, so we attribute the
+                    // whole process to the main thread as a fallback.
+                    None if thread == self.data.main_thread_handle => self.cpu(line.resources.cpu),
+                    None => CpuDelta::ZERO,
                 };
                 self.parent
                     .profile
@@ -591,4 +590,142 @@ fn write_profile(output_path: &Path, profile: Profile) -> Result<(), ExportError
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ProcessResources, StackTrace, ThreadResources};
+
+    fn stacktrace(thread_id: u64, name: &str) -> StackTrace {
+        StackTrace {
+            pid: 1,
+            thread_id,
+            thread_name: Some(name.to_string()),
+            os_thread_id: Some(thread_id),
+            active: true,
+            owns_gil: false,
+            frames: vec![crate::types::Frame {
+                name: "work".to_string(),
+                filename: "/app/main.py".to_string(),
+                module: None,
+                short_filename: Some("main.py".to_string()),
+                line: 42,
+                locals: None,
+                is_entry: false,
+            }],
+            process_info: None,
+        }
+    }
+
+    fn line(time: u128, stacktraces: Vec<StackTrace>, thread_cpu: &[(u64, f32)]) -> JsonLine {
+        JsonLine {
+            stacktraces,
+            stacktrace_error: None,
+            resources: ProcessResources {
+                memory: 1024,
+                cpu: 50.0,
+                disk_read_bytes: 0,
+                disk_write_bytes: 0,
+                thread_resources: thread_cpu
+                    .iter()
+                    .map(|&(id, cpu)| {
+                        (
+                            id,
+                            ThreadResources {
+                                cpu,
+                                memory: 0,
+                                disk_read_bytes: 0,
+                                disk_write_bytes: 0,
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+            index: 0,
+            time,
+        }
+    }
+
+    fn args() -> FirefoxExportArguments {
+        FirefoxExportArguments {
+            bandwidth: true,
+            data_dir: PathBuf::new(),
+            output_file: PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn sampling_interval_ignores_deltas_across_files() {
+        // Interleaved processes would produce many tiny deltas if all samples were mixed
+        let first = (0..10).map(|i| line(1000 + i * 100, vec![], &[])).collect();
+        let second = (0..10).map(|i| line(1050 + i * 100, vec![], &[])).collect();
+        let files: Vec<Vec<JsonLine>> = vec![first, second];
+
+        assert_eq!(ProfileBuilder::sampling_interval(files.iter()), 100);
+    }
+
+    #[test]
+    fn sampling_interval_falls_back_to_the_default_with_one_sample_per_file() {
+        let files: Vec<Vec<JsonLine>> =
+            vec![vec![line(1000, vec![], &[])], vec![line(1000, vec![], &[])]];
+
+        assert_eq!(
+            ProfileBuilder::sampling_interval(files.iter()),
+            DEFAULT_INTERVAL_MILLIS
+        );
+    }
+
+    #[test]
+    fn exports_threads_and_skips_processes_without_stacktraces() {
+        let threads = || vec![stacktrace(1, MAIN_THREAD_NAME), stacktrace(2, "worker")];
+        let python = (0..3)
+            .map(|i| line(1000 + i * 100, threads(), &[(1, 80.0), (2, 20.0)]))
+            .collect();
+        let mut failed_line = line(1000, vec![], &[]);
+        failed_line.stacktrace_error = Some("not a python process".to_string());
+
+        let processes = HashMap::from([
+            (ReportIdentifier::Pid(1), python),
+            (ReportIdentifier::Pid(2), vec![failed_line]),
+            (
+                ReportIdentifier::Global,
+                (0..3).map(|i| line(1000 + i * 100, vec![], &[])).collect(),
+            ),
+        ]);
+
+        let profile = generate_fxprof(processes, &args()).unwrap();
+        let json = serde_json::to_value(&profile).unwrap();
+
+        let mut thread_names = json["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        thread_names.sort();
+        // Global has one thread, process 1 has two and process 2 is skipped
+        // The main thread of each process is named after the process
+        assert_eq!(thread_names, ["Global", "Process", "worker"]);
+
+        // Each thread gets its own CPU usage, not the one of the whole process (50%)
+        let cpu_deltas = |name: &str| {
+            let thread = json["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap();
+            thread["samples"]["threadCPUDelta"].clone()
+        };
+        // 80% and 20% of a 100ms interval, in µs
+        assert_eq!(
+            cpu_deltas("Process"),
+            serde_json::json!([80000, 80000, 80000])
+        );
+        assert_eq!(
+            cpu_deltas("worker"),
+            serde_json::json!([20000, 20000, 20000])
+        );
+    }
 }
