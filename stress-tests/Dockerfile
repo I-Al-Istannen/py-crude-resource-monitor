@@ -24,6 +24,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM python:3.12-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends libunwind8 && \
     rm -rf /var/lib/apt/lists/*
+# For the polars scenario
+RUN pip install --no-cache-dir --root-user-action=ignore polars==2.1.0
 COPY --from=build /usr/local/bin/py-crude-resource-monitor /usr/local/bin/
 # The suite itself is mounted at runtime, so it can be changed without rebuilding the image
 WORKDIR /stress-tests

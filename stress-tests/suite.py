@@ -29,7 +29,7 @@ MiB = 1024 * 1024
 PASS, FAIL, LIMITATION, INFO = "pass", "FAIL", "limitation", "info"
 
 # Extra arguments for `profile` per scenario
-PROFILER_ARGS = {"native_stacks": ["--native"]}
+PROFILER_ARGS = {"native_stacks": ["--native"], "polars_query": ["--native", "all"]}
 
 
 @dataclass
@@ -228,6 +228,27 @@ def check_native_stack(profile, truth, phase, check):
     )
 
 
+def check_native_thread(profile, truth, phase, check):
+    """Samples contain a thread without any Python frames that runs code from `library`. py-spy
+    only captures such threads with `--native all`."""
+    library = check["library"]
+    samples = profile.window(phase["pid"], phase["start"], phase["end"])
+    if not samples:
+        return FAIL, "samples in phase", "none"
+
+    def native_only(trace):
+        filenames = [frame["filename"] for frame in trace["frames"]]
+        return not any(f.endswith(".py") for f in filenames) and any(library in f for f in filenames)
+
+    hits = sum(any(native_only(t) for t in s["stacktraces"]) for s in samples)
+    status = PASS if hits / len(samples) >= 0.9 else FAIL
+    return (
+        status,
+        f">= 90% of samples with a {library} thread without Python frames",
+        f"{hits / len(samples):.0%} ({hits}/{len(samples)})",
+    )
+
+
 def check_memory(profile, truth, phase, check):
     samples = profile.window(phase["pid"], phase["start"], phase["end"])
     if not samples:
@@ -378,6 +399,7 @@ CHECKS = {
     "firefox_thread_cpu": check_firefox_thread_cpu,
     "stack": check_stack,
     "native_stack": check_native_stack,
+    "native_thread": check_native_thread,
     "memory": check_memory,
     "growth_attribution": check_growth_attribution,
     "peak_missed": check_peak_missed,
