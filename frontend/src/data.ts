@@ -143,9 +143,9 @@ export async function fetchReportNames(): Promise<string[]> {
   }
   const response = await fetch(`${baseUrl()}/view/profiles.json`);
   if (response.status !== 200) {
-    console.log(response.status);
-    alert("Error fetching server reports");
     console.log(await response.text());
+    alert("Error fetching server reports");
+    throw new Error(`Fetching report names failed with status ${response.status}`);
   }
   return z.array(z.string()).parse(await response.json());
 }
@@ -170,9 +170,9 @@ export async function fetchReportByName(name: string) {
 
   const response = await fetch(`${baseUrl()}/view/${name}`);
   if (response.status !== 200) {
-    console.log(response.status);
-    alert(`Error fetching report ${name}`);
     console.log(await response.text());
+    alert(`Error fetching report ${name}`);
+    throw new Error(`Fetching report ${name} failed with status ${response.status}`);
   }
   return parseJsonProcessReport(name, await response.text());
 }
