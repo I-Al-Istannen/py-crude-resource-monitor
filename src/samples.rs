@@ -14,13 +14,153 @@
 //! A stack is its innermost frame on top of the stack of its caller (`parent`), so stacks sharing
 //! callers share lines. The ids of frames and stacks count up from 0 in every file. Profiles
 //! written by older versions store the frames in the samples instead, and are read just the same.
+//!
+//! The files are compressed with zstd unless the user asks for plain ones. Both can be cut off
+//! after any byte if the profiler is killed, so readers use all complete lines before that.
 
 use crate::types::{Frame, JsonLine, StackTrace, StoredStackTrace};
+use log::warn;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+const COMPRESSED_SUFFIX: &str = ".json.zst";
+const PLAIN_SUFFIX: &str = ".json";
+
+/// How often compressed files are flushed. Every flush makes the compression worse, so we do not
+/// flush every line, and lose at most this much data if the profiler is killed.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+const COMPRESSION_LEVEL: i32 = 3;
+
+/// A sample file open for appending
+pub enum SampleFile {
+    Plain(BufWriter<File>),
+    Compressed {
+        encoder: zstd::Encoder<'static, File>,
+        last_flush: Instant,
+    },
+}
+
+impl SampleFile {
+    /// Opens the sample file `name` (e.g. `42` or `global`) in `dir`. A compressed file gets a new
+    /// zstd frame, so a closed file can be opened again.
+    pub fn open(dir: &Path, name: &str, compress: bool) -> io::Result<Self> {
+        let suffix = if compress {
+            COMPRESSED_SUFFIX
+        } else {
+            PLAIN_SUFFIX
+        };
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(format!("{name}{suffix}")))?;
+        if !compress {
+            return Ok(Self::Plain(BufWriter::new(file)));
+        }
+        let mut encoder = zstd::Encoder::new(file, COMPRESSION_LEVEL)?;
+        encoder.include_checksum(true)?;
+        Ok(Self::Compressed {
+            encoder,
+            last_flush: Instant::now(),
+        })
+    }
+
+    /// Makes the lines written so far readable, see [`FLUSH_INTERVAL`] for compressed files.
+    pub fn flush_lines(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(file) => file.flush(),
+            Self::Compressed {
+                encoder,
+                last_flush,
+            } => {
+                if last_flush.elapsed() < FLUSH_INTERVAL {
+                    return Ok(());
+                }
+                *last_flush = Instant::now();
+                encoder.flush()
+            }
+        }
+    }
+
+    /// Writes everything and ends the zstd frame of compressed files
+    pub fn close(self) -> io::Result<()> {
+        match self {
+            Self::Plain(mut file) => file.flush(),
+            Self::Compressed { encoder, .. } => encoder.finish().map(|_| ()),
+        }
+    }
+}
+
+impl Write for SampleFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(file) => file.write(buf),
+            Self::Compressed { encoder, .. } => encoder.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(file) => file.flush(),
+            Self::Compressed { encoder, .. } => encoder.flush(),
+        }
+    }
+}
+
+/// The sample files in `dir`, with their names without extension, e.g. `42` or `global`
+pub fn sample_files(dir: &Path) -> io::Result<Vec<(String, PathBuf)>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(file_name) = path.file_name().and_then(|it| it.to_str()) else {
+            continue;
+        };
+        let name = file_name
+            .strip_suffix(COMPRESSED_SUFFIX)
+            .or_else(|| file_name.strip_suffix(PLAIN_SUFFIX));
+        if let Some(name) = name
+            && path.is_file()
+        {
+            files.push((name.to_string(), path));
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Reads a sample file, decompressing it if needed. Content after the last complete zstd block,
+/// e.g. because the profiler is still running or was killed, is skipped.
+pub fn read_sample_file(path: &Path) -> io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    let mut content = if path.to_string_lossy().ends_with(COMPRESSED_SUFFIX) {
+        let mut content = Vec::new();
+        match zstd::Decoder::new(bytes.as_slice())?.read_to_end(&mut content) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => warn!(
+                "`{}` ends in an incomplete zstd frame. Reading the samples before it, the \
+                profiler is probably still running or was killed",
+                path.display()
+            ),
+            Err(e) => return Err(e),
+        }
+        content
+    } else {
+        bytes
+    };
+
+    match std::str::from_utf8(&content) {
+        Ok(_) => {}
+        // The file was cut off within a character, the line is incomplete anyway
+        Err(e) if e.error_len().is_none() => content.truncate(e.valid_up_to()),
+        Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+    }
+    Ok(String::from_utf8(content).expect("checked above"))
+}
 
 #[derive(Debug, Snafu)]
 pub enum ReadSamplesError {
@@ -135,17 +275,40 @@ pub fn write_line(out: &mut impl Write, value: &impl Serialize) -> serde_json::R
     out.write_all(b"\n").map_err(serde_json::Error::io)
 }
 
-/// Reads the samples of a sample file, resolving the stacks of their threads.
+/// Reads the samples of a sample file, resolving the stacks of their threads. An incomplete last
+/// line is skipped.
 pub fn read_samples(content: &str) -> Result<Vec<JsonLine>, ReadSamplesError> {
-    let mut frames: Vec<Frame> = Vec::new();
-    // The parent and frame of every stack
-    let mut stacks: Vec<(Option<u32>, u32)> = Vec::new();
-    let mut samples = Vec::new();
+    let mut reader = SampleReader::default();
+    let mut lines = content.lines().enumerate().peekable();
+    while let Some((index, text)) = lines.next() {
+        if let Err(e) = reader.read_line(text, index + 1) {
+            if lines.peek().is_none() && !content.ends_with('\n') {
+                warn!("Skipping the incomplete last line: {e}");
+                break;
+            }
+            return Err(e);
+        }
+    }
+    Ok(reader.samples)
+}
 
-    for (index, text) in content.lines().enumerate() {
-        let line = index + 1;
+#[derive(Default)]
+struct SampleReader {
+    frames: Vec<Frame>,
+    /// The parent and frame of every stack
+    stacks: Vec<(Option<u32>, u32)>,
+    samples: Vec<JsonLine>,
+}
+
+impl SampleReader {
+    fn read_line(&mut self, text: &str, line: usize) -> Result<(), ReadSamplesError> {
+        let Self {
+            frames,
+            stacks,
+            samples,
+        } = self;
         if text.is_empty() {
-            continue;
+            return Ok(());
         }
         // The writer emits the fields in declaration order, so the first key tells the line type
         if text.starts_with(r#"{"frame":"#) {
@@ -167,7 +330,7 @@ pub fn read_samples(content: &str) -> Result<Vec<JsonLine>, ReadSamplesError> {
             let stacktraces = sample
                 .stacktraces
                 .into_iter()
-                .map(|trace| resolve(trace, &frames, &stacks, line))
+                .map(|trace| resolve(trace, frames, stacks, line))
                 .collect::<Result<_, _>>()?;
             samples.push(JsonLine {
                 stacktraces,
@@ -179,9 +342,8 @@ pub fn read_samples(content: &str) -> Result<Vec<JsonLine>, ReadSamplesError> {
                 time: sample.time,
             });
         }
+        Ok(())
     }
-
-    Ok(samples)
 }
 
 fn resolve(
@@ -402,7 +564,7 @@ mod tests {
 
     #[test]
     fn rejects_references_to_undefined_stacks() {
-        let line = r#"{"stack":0,"parent":3,"frame":0}"#;
+        let line = "{\"stack\":0,\"parent\":3,\"frame\":0}\n";
 
         let error = read_samples(line).unwrap_err();
 
@@ -414,5 +576,80 @@ mod tests {
                 line: 1
             }
         ));
+    }
+
+    fn write_file(dir: &Path, compress: bool, samples: Vec<Vec<StackTrace>>) {
+        let mut table = StackTable::default();
+        for (index, traces) in samples.into_iter().enumerate() {
+            // Reopen the file for every sample, as the writer does when too many files are open
+            let mut file = SampleFile::open(dir, "42", compress).unwrap();
+            let stacktraces = traces
+                .into_iter()
+                .map(|trace| table.store(trace, &mut file).unwrap())
+                .collect();
+            write_line(&mut file, &sample(stacktraces, index)).unwrap();
+            file.close().unwrap();
+        }
+    }
+
+    fn three_samples() -> Vec<Vec<StackTrace>> {
+        (0..3)
+            .map(|i| vec![trace(1, vec![frame("work", i), frame("main", 1)])])
+            .collect()
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("prm-samples-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn read_dir(dir: &Path) -> Vec<JsonLine> {
+        let files = sample_files(dir).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "42");
+        read_samples(&read_sample_file(&files[0].1).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn reads_compressed_and_plain_files() {
+        for compress in [true, false] {
+            let dir = temp_dir(&format!("{compress}"));
+
+            write_file(&dir, compress, three_samples());
+
+            let file_name = sample_files(&dir).unwrap()[0].1.clone();
+            assert_eq!(file_name.to_string_lossy().ends_with(".zst"), compress);
+            let names: Vec<_> = frames_of(&read_dir(&dir))
+                .into_iter()
+                .map(|sample| sample[0][0].1)
+                .collect();
+            assert_eq!(names, [0, 1, 2]);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn reads_the_complete_lines_of_cut_off_files() {
+        for compress in [true, false] {
+            let dir = temp_dir(&format!("cut-{compress}"));
+            write_file(&dir, compress, three_samples());
+            let path = sample_files(&dir).unwrap()[0].1.clone();
+            let full = std::fs::read(&path).unwrap();
+
+            // Every possible end must be readable, and never yield more samples than were written
+            let mut read_counts = Vec::new();
+            for length in 0..full.len() {
+                std::fs::write(&path, &full[..length]).unwrap();
+                read_counts.push(read_dir(&dir).len());
+            }
+
+            assert!(read_counts.is_sorted(), "{read_counts:?}");
+            assert_eq!(read_counts.first(), Some(&0));
+            assert!(read_counts.contains(&2), "{read_counts:?}");
+            assert!(read_counts.iter().all(|it| *it <= 3), "{read_counts:?}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }
