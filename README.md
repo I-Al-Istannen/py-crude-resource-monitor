@@ -42,7 +42,7 @@ pixi global install py-crude-resource-monitor
 > scope](https://www.kernel.org/doc/html/latest/admin-guide/LSM/Yama.html#ptrace-scope)
 > to `0` or `1` instead.
 > If you are on macOS, you need root privileges to profile processes.
-> When running `sudo py-crude-resource-monitor profile ... -- my-command`, the subprocess will be invoked by the user invoking `sudo` (by using `$SUDO_UID` and `$SUDO_GID`).
+> When running `sudo py-crude-resource-monitor profile py-spy ... -- my-command`, the subprocess will be invoked by the user invoking `sudo` (by using `$SUDO_UID` and `$SUDO_GID`).
 
 ```text
 A small utility to monitor resource usage of Python processes
@@ -63,7 +63,21 @@ Options:
 ```text
 Profile a Python process
 
-Usage: py-crude-resource-monitor profile [OPTIONS] --output-dir <OUTPUT_DIR> <--pid <PID>|COMMAND>
+Usage: py-crude-resource-monitor profile <COMMAND>
+
+Commands:
+  py-spy   Capture the Python stacks with py-spy
+  tachyon  Capture the Python stacks with Tachyon, the sampling profiler built into CPython 3.15
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+```text
+Capture the Python stacks with py-spy
+
+Usage: py-crude-resource-monitor profile py-spy [OPTIONS] --output-dir <OUTPUT_DIR> <--pid <PID>|COMMAND>
 
 Arguments:
   [COMMAND]...  The command to execute
@@ -84,9 +98,43 @@ Options:
                                  times as much space
   -y, --yes                      Delete samples from a previous run in the output directory without
                                  asking
+      --nonblocking              Do not pause the profiled processes while capturing their stacks.
+                                 This makes sampling cheaper for them, but the stacks can be
+                                 inconsistent, e.g. contain frames that already returned
       --native [<NATIVE>]        capture native stack traces. If given without a value, defaults to
                                  `native-stacks`. [default: none] [possible values: native-stacks,
                                  all, none]
+  -h, --help                     Print help (see more with '--help')
+```
+
+```text
+Capture the Python stacks with Tachyon, the sampling profiler built into CPython 3.15
+
+Usage: py-crude-resource-monitor profile tachyon [OPTIONS] --output-dir <OUTPUT_DIR> <--pid <PID>|COMMAND>
+
+Arguments:
+  [COMMAND]...  The command to execute
+
+Options:
+  -p, --pid <PID>                The PID of the Python process to monitor
+  -o, --output-dir <OUTPUT_DIR>  output directory
+  -i, --interval <MS>            Milliseconds between samples [default: 1000]
+      --memory-interval <MS>     Milliseconds between memory measurements taken in between the
+                                 samples, so short allocation spikes are not missed. Only changes
+                                 are stored. 0 disables them [default: 10]
+      --pss                      Also record the proportional set size (PSS) of every process, which
+                                 splits memory shared between processes, e.g. after a fork, between
+                                 them. Linux only. Reading it takes longer the more memory a process
+                                 uses
+      --uncompressed             Write the samples as plain JSON lines instead of compressing them
+                                 with zstd, e.g. to follow them with `tail -f`. They take up several
+                                 times as much space
+  -y, --yes                      Delete samples from a previous run in the output directory without
+                                 asking
+      --python <PYTHON>          The Python interpreter Tachyon runs on [default: python3.15]
+      --pause                    Pause the profiled processes while capturing their stacks.
+                                 Otherwise the stacks can be inconsistent, e.g. contain frames that
+                                 already returned
   -h, --help                     Print help (see more with '--help')
 ```
 
