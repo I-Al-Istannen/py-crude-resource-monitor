@@ -30,6 +30,7 @@ Every check has one of these outcomes:
 | `gil_threads`       | Four GIL-bound threads share one core, four GIL-releasing threads use four. Per-thread CPU makes this visible. |
 | `pool_cpu`          | Pool workers are discovered and accounted separately, the parent is idle in `Pool.map`.                        |
 | `child_processes`   | Python grandchildren behind a shell are profiled, non-Python children get resources without stacks.           |
+| `native_stacks`     | With `--native`, samples show the C functions (zlib's `deflate`) below the Python frame calling them.        |
 | `pool_churn`        | A pool recreated 30 times fills as many Firefox tracks as it has workers, without losing CPU time.            |
 | `short_lived`       | *Limitation*: children living shorter than a sampling interval get only part of their CPU attributed.         |
 | `memory_steps`      | RSS follows allocations and frees, memory growth is attributed to the function that allocates.                 |
@@ -42,4 +43,4 @@ Every check has one of these outcomes:
 Write a script in `scenarios/` that creates a `Truth`, wraps each part of its work in
 `truth.phase(name, checks=[...])` and calls `truth.save()` at the end. The available checks are the
 `check_*` functions in `suite.py`. Look at them to see which ground-truth fields they read from the
-phase.
+phase. If the scenario needs extra `profile` arguments, add them to `PROFILER_ARGS` in `suite.py`.

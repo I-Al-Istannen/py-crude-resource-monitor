@@ -28,6 +28,9 @@ MiB = 1024 * 1024
 
 PASS, FAIL, LIMITATION, INFO = "pass", "FAIL", "limitation", "info"
 
+# Extra arguments for `profile` per scenario
+PROFILER_ARGS = {"native_stacks": ["--native"]}
+
 
 @dataclass
 class Result:
@@ -199,6 +202,32 @@ def check_stack(profile, truth, phase, check):
     )
 
 
+def check_native_stack(profile, truth, phase, check):
+    """Samples show the native `function` from `library` running below the Python `caller`."""
+    caller, function, library = check["caller"], check["function"], check["library"]
+    samples = profile.window(phase["pid"], phase["start"], phase["end"])
+    if not samples:
+        return FAIL, "samples in phase", "none"
+
+    def native_below_caller(trace):
+        # Frames are ordered from the innermost one outwards
+        names = [frame["name"] for frame in trace["frames"]]
+        if caller not in names:
+            return False
+        return any(
+            frame["name"] == function and library in frame["filename"]
+            for frame in trace["frames"][: names.index(caller)]
+        )
+
+    hits = sum(any(native_below_caller(t) for t in s["stacktraces"]) for s in samples)
+    status = PASS if hits / len(samples) >= 0.9 else FAIL
+    return (
+        status,
+        f">= 90% of samples in {library} {function} below {caller}",
+        f"{hits / len(samples):.0%} ({hits}/{len(samples)})",
+    )
+
+
 def check_memory(profile, truth, phase, check):
     samples = profile.window(phase["pid"], phase["start"], phase["end"])
     if not samples:
@@ -348,6 +377,7 @@ CHECKS = {
     "thread_cpu": check_thread_cpu,
     "firefox_thread_cpu": check_firefox_thread_cpu,
     "stack": check_stack,
+    "native_stack": check_native_stack,
     "memory": check_memory,
     "growth_attribution": check_growth_attribution,
     "peak_missed": check_peak_missed,
@@ -371,6 +401,7 @@ def run_scenario(name: str, args, cpus: int) -> tuple[str, list[Result]]:
         args.binary, "profile", "--yes",
         "--interval", str(args.interval),
         "--output-dir", str(profile_dir),
+        *PROFILER_ARGS.get(name, []),
         "--", sys.executable, str(SCENARIOS / f"{name}.py"),
     ]  # fmt: skip
     environment = {
