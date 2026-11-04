@@ -1,7 +1,7 @@
+use crate::view::Asset;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use flate2::Compression;
-use rust_embed::Embed;
 use serde_json::json;
 use snafu::{IntoError, Location, NoneError, ResultExt, Snafu};
 use std::io::Write;
@@ -52,10 +52,6 @@ pub enum ExportError {
         location: Location,
     },
 }
-
-#[derive(Embed)]
-#[folder = "frontend/dist/"]
-struct Asset;
 
 pub(super) fn export_report(data_dir: &Path, output_file: &Path) -> Result<(), ExportError> {
     let mut reports = Vec::new();
