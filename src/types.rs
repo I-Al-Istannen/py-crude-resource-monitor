@@ -77,6 +77,9 @@ pub struct StackTrace {
     pub os_thread_id: Option<u64>,
     pub active: bool,
     pub owns_gil: bool,
+    /// Whether the thread waits to take the GIL. Only Tachyon reports it.
+    #[serde(default)]
+    pub waiting_for_gil: bool,
     pub frames: Vec<Frame>,
     pub process_info: Option<ProcessInfo>,
 }
@@ -90,6 +93,7 @@ impl From<py_spy::StackTrace> for StackTrace {
             os_thread_id: trace.os_thread_id,
             active: trace.active,
             owns_gil: trace.owns_gil,
+            waiting_for_gil: false,
             frames: trace.frames.into_iter().map(|f| f.into()).collect(),
             process_info: trace.process_info.map(|p| (*p).clone().into()),
         }
@@ -106,6 +110,9 @@ pub struct StoredStackTrace {
     pub os_thread_id: Option<u64>,
     pub active: bool,
     pub owns_gil: bool,
+    /// Omitted if false, which it always is with py-spy
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_for_gil: bool,
     /// `None` if the thread has no frames
     #[serde(default)]
     pub stack: Option<u32>,

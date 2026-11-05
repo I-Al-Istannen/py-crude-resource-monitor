@@ -131,7 +131,8 @@ enum ProfileBackend {
     },
     /// Capture the Python stacks with Tachyon, the sampling profiler built into CPython 3.15
     ///
-    /// It can only profile processes with the same Python minor version as `--python`.
+    /// It can only profile processes with the same Python minor version as `--python`. Unlike
+    /// py-spy, it records which threads wait for the GIL.
     Tachyon {
         #[command(flatten)]
         args: ProfileArgs,

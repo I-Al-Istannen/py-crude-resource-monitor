@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 const MAIN_THREAD_NAME: &str = "MainThread";
 const CATEGORY_PYTHON_NAME: &str = "Python";
 const CATEGORY_NATIVE_NAME: &str = "Native";
+const CATEGORY_GIL_WAIT_NAME: &str = "Waiting for GIL";
+/// The frame added on top of the stacks of threads waiting for the GIL
+const GIL_WAIT_FRAME_NAME: &str = "<waiting for GIL>";
 /// The pid of the track with the total PSS, which is not a real process. The Firefox Profiler
 /// groups tracks by pid, so it must not be the pid of the global track.
 const PSS_TOTAL_PID: u32 = u32::MAX;
@@ -65,6 +68,7 @@ struct ProfileBuilder {
     profile: Profile,
     category_native: CategoryHandle,
     category_python: CategoryHandle,
+    category_gil_wait: CategoryHandle,
     include_bandwidth: bool,
     memory: MemoryMetric,
     /// The main thread of every process in the order they were added, i.e. the global tracks
@@ -143,6 +147,7 @@ impl ProfileBuilder {
         );
         let category_python = profile.add_category(CATEGORY_PYTHON_NAME, CategoryColor::Blue);
         let category_native = profile.add_category(CATEGORY_NATIVE_NAME, CategoryColor::Green);
+        let category_gil_wait = profile.add_category(CATEGORY_GIL_WAIT_NAME, CategoryColor::Red);
 
         Self {
             interval_millis,
@@ -150,6 +155,7 @@ impl ProfileBuilder {
             start_time_millis,
             category_native,
             category_python,
+            category_gil_wait,
             include_bandwidth,
             memory,
             main_threads: Vec::new(),
@@ -218,6 +224,9 @@ impl ProfileBuilder {
             count => format!("{} ({count} processes)", first.name()),
         };
         let mut process = ProfileBuilderProcess::new(self, &name, pid, start, pack_threads);
+        if lane.iter().any(Instance::waits_for_gil) {
+            process.add_gil_wait_counter();
+        }
         let mut previous_end = None;
         for instance in lane {
             if let Some(previous_end) = previous_end {
@@ -312,6 +321,14 @@ impl Instance {
     fn has_stacktraces(&self) -> bool {
         self.samples.iter().any(|it| !it.stacktraces.is_empty())
     }
+
+    /// Only Tachyon knows whether threads wait for the GIL
+    fn waits_for_gil(&self) -> bool {
+        self.samples
+            .iter()
+            .flat_map(|it| &it.stacktraces)
+            .any(|it| it.waiting_for_gil)
+    }
 }
 
 /// A process in the Firefox profile. With `pack_threads`, threads whose names only differ in
@@ -329,6 +346,8 @@ struct ProfileBuilderProcess<'a> {
     thread_end_times: HashMap<ThreadHandle, Timestamp>,
     memory_counter: ProfileCounter<Initialized>,
     io_counter: Option<ProfileCounter<Initialized>>,
+    /// The number of threads waiting for the GIL, see [`Self::add_gil_wait_counter`]
+    gil_wait_counter: Option<CounterHandle>,
 }
 
 impl<'a> ProfileBuilderProcess<'a> {
@@ -397,7 +416,23 @@ impl<'a> ProfileBuilderProcess<'a> {
             thread_end_times: HashMap::new(),
             memory_counter,
             io_counter,
+            gil_wait_counter: None,
         }
+    }
+
+    /// Adds a track with the number of threads waiting for the GIL. Unlike the other counters, its
+    /// samples are the values themselves, not changes, as the Firefox Profiler plots each sample
+    /// divided by the time since the previous one for counters it does not know.
+    fn add_gil_wait_counter(&mut self) {
+        let profile = &mut self.parent.profile;
+        let handle = profile.add_counter(
+            self.process,
+            "Threads waiting for GIL",
+            "GIL",
+            "The number of threads waiting to take the GIL",
+        );
+        profile.set_counter_color(handle, GraphColor::Red);
+        self.gil_wait_counter = Some(handle);
     }
 
     fn time(&self, millis: u128) -> Timestamp {
@@ -497,6 +532,8 @@ impl<'a> ProfileBuilderProcess<'a> {
         for line in samples {
             let timestamp = self.time(line.time);
             self.add_memory_samples(&line.memory_samples);
+            let gil_waiters = line.stacktraces.iter().filter(|it| it.waiting_for_gil);
+            self.add_gil_wait_value(timestamp, gil_waiters.count());
 
             for stacktrace in line.stacktraces {
                 let thread = if stacktrace.thread_id == main_thread_id {
@@ -555,6 +592,14 @@ impl<'a> ProfileBuilderProcess<'a> {
                         } else {
                             self.parent.category_python.into()
                         },
+                        flags: FrameFlags::empty(),
+                    });
+                }
+                // Shows the wait in the call tree and colors it in the activity graph
+                if stacktrace.waiting_for_gil {
+                    stack_frames.push(FrameInfo {
+                        frame: Frame::Label(self.parent.profile.intern_string(GIL_WAIT_FRAME_NAME)),
+                        category_pair: self.parent.category_gil_wait.into(),
                         flags: FrameFlags::empty(),
                     });
                 }
@@ -623,8 +668,17 @@ impl<'a> ProfileBuilderProcess<'a> {
         }
     }
 
+    fn add_gil_wait_value(&mut self, timestamp: Timestamp, waiters: usize) {
+        if let Some(counter) = self.gil_wait_counter {
+            self.parent
+                .profile
+                .add_counter_sample(counter, timestamp, waiters as f64, 1);
+        }
+    }
+
     fn reset_counters(&mut self, millis: u128) {
         let timestamp = self.time(millis);
+        self.add_gil_wait_value(timestamp, 0);
         self.add_counter_values(
             timestamp,
             &ProcessResources {
@@ -1184,6 +1238,7 @@ mod tests {
             os_thread_id: Some(thread_id),
             active: true,
             owns_gil: false,
+            waiting_for_gil: false,
             frames: vec![crate::types::Frame {
                 name: "work".to_string(),
                 filename: "/app/main.py".to_string(),
@@ -1732,6 +1787,89 @@ mod tests {
         expected.push("Process".to_string());
         expected.sort();
         assert_eq!(visible, expected);
+    }
+
+    /// The name and category of the innermost frame of every sample of `thread`
+    fn leaf_frames(json: &serde_json::Value, thread: &str) -> Vec<(String, String)> {
+        let thread = json["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == thread)
+            .unwrap();
+        let strings = thread["stringArray"].as_array().unwrap();
+        let index = |value: &serde_json::Value| value.as_u64().unwrap() as usize;
+        thread["samples"]["stack"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|stack| {
+                let frame = index(&thread["stackTable"]["frame"][index(stack)]);
+                let func = index(&thread["frameTable"]["func"][frame]);
+                let category = index(&thread["frameTable"]["category"][frame]);
+                (
+                    strings[index(&thread["funcTable"]["name"][func])]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                    json["meta"]["categories"][category]["name"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The values of the GIL wait counter of the process with `pid`, if it has one
+    fn gil_wait_counts(json: &serde_json::Value, pid: u32) -> Option<Vec<f64>> {
+        let pid = pid.to_string();
+        let counter = json["counters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["category"] == "GIL" && c["pid"] == pid)?;
+        let counts = counter["samples"]["count"].as_array().unwrap();
+        Some(counts.iter().map(|it| it.as_f64().unwrap()).collect())
+    }
+
+    #[test]
+    fn marks_threads_waiting_for_the_gil() {
+        let samples = (0..3)
+            .map(|i| {
+                let mut worker = stacktrace(2, "worker");
+                worker.waiting_for_gil = i == 1;
+                let mut other = stacktrace(3, "other");
+                other.waiting_for_gil = i >= 1;
+                line(
+                    1000 + i * 100,
+                    vec![stacktrace(1, MAIN_THREAD_NAME), worker, other],
+                    &[],
+                )
+            })
+            .collect();
+        let json = processes_json(HashMap::from([(ReportIdentifier::Pid(1), samples)]));
+
+        let work = (
+            "work (main.py:42)".to_string(),
+            CATEGORY_PYTHON_NAME.to_string(),
+        );
+        let wait = (
+            GIL_WAIT_FRAME_NAME.to_string(),
+            CATEGORY_GIL_WAIT_NAME.to_string(),
+        );
+        assert_eq!(leaf_frames(&json, "worker"), [work.clone(), wait, work]);
+        assert_eq!(gil_wait_counts(&json, 1), Some(vec![0.0, 2.0, 1.0]));
+    }
+
+    #[test]
+    fn adds_no_gil_wait_track_without_waiting_threads() {
+        let samples = (0..3)
+            .map(|i| line(1000 + i * 100, vec![stacktrace(1, MAIN_THREAD_NAME)], &[]))
+            .collect();
+        let json = processes_json(HashMap::from([(ReportIdentifier::Pid(1), samples)]));
+
+        assert_eq!(gil_wait_counts(&json, 1), None);
     }
 
     #[test]

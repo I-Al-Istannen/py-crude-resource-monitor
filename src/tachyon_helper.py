@@ -80,6 +80,7 @@ def convert(pid, interpreters):
                     # Always false with `--pause`, as the threads are stopped. Nothing reads it.
                     "active": bool(thread.status & rd.THREAD_STATUS_ON_CPU),
                     "owns_gil": bool(thread.status & rd.THREAD_STATUS_HAS_GIL),
+                    "waiting_for_gil": bool(thread.status & rd.THREAD_STATUS_GIL_REQUESTED),
                     "frames": frames,
                     "process_info": None,
                 }
