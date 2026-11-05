@@ -221,6 +221,7 @@ impl StackTable {
             os_thread_id: trace.os_thread_id,
             active: trace.active,
             owns_gil: trace.owns_gil,
+            waiting_for_gil: trace.waiting_for_gil,
             frames: vec![],
             process_info: trace.process_info,
         })
@@ -371,6 +372,7 @@ fn resolve(
         os_thread_id: trace.os_thread_id,
         active: trace.active,
         owns_gil: trace.owns_gil,
+        waiting_for_gil: trace.waiting_for_gil,
         frames: resolved,
         process_info: trace.process_info,
     })
@@ -431,6 +433,7 @@ mod tests {
             os_thread_id: Some(thread_id),
             active: true,
             owns_gil: false,
+            waiting_for_gil: false,
             frames,
             process_info: None,
         }
@@ -519,6 +522,23 @@ mod tests {
             Some("thread-2")
         );
         assert_eq!(read[2].index, 2);
+    }
+
+    #[test]
+    fn stores_gil_waits_only_if_a_thread_waits() {
+        let mut waiting = trace(2, vec![frame("work", 5)]);
+        waiting.waiting_for_gil = true;
+
+        let written = write(vec![vec![trace(1, vec![frame("work", 5)]), waiting]]);
+        let read = read_samples(&written).unwrap();
+
+        assert_eq!(written.matches("waiting_for_gil").count(), 1);
+        let waits: Vec<bool> = read[0]
+            .stacktraces
+            .iter()
+            .map(|it| it.waiting_for_gil)
+            .collect();
+        assert_eq!(waits, [false, true]);
     }
 
     #[test]
