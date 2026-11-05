@@ -70,6 +70,7 @@ struct ProfileBuilder {
     category_python: CategoryHandle,
     category_gil_wait: CategoryHandle,
     include_bandwidth: bool,
+    include_gil_waiters: bool,
     memory: MemoryMetric,
     /// The main thread of every process in the order they were added, i.e. the global tracks
     /// first and then by start time
@@ -91,6 +92,7 @@ impl ProfileBuilder {
     pub fn from_samples<'a, T: Iterator<Item = &'a Vec<JsonLine>>>(
         samples: impl Fn() -> T,
         include_bandwidth: bool,
+        include_gil_waiters: bool,
         memory: MemoryMetric,
     ) -> Result<Self, Whatever> {
         let start_time_millis = Self::start_time(samples().flat_map(|lines| lines.iter()))?;
@@ -100,6 +102,7 @@ impl ProfileBuilder {
             start_time_millis,
             interval_millis,
             include_bandwidth,
+            include_gil_waiters,
             memory,
         ))
     }
@@ -137,6 +140,7 @@ impl ProfileBuilder {
         start_time_millis: u128,
         interval_millis: u64,
         include_bandwidth: bool,
+        include_gil_waiters: bool,
         memory: MemoryMetric,
     ) -> Self {
         let mut profile = Profile::new(
@@ -158,6 +162,7 @@ impl ProfileBuilder {
             category_python,
             category_gil_wait,
             include_bandwidth,
+            include_gil_waiters,
             memory,
             main_threads: Vec::new(),
             thread_cpu: HashMap::new(),
@@ -224,8 +229,9 @@ impl ProfileBuilder {
             1 => first.name().to_string(),
             count => format!("{} ({count} processes)", first.name()),
         };
+        let gil_waiters = self.include_gil_waiters && lane.iter().any(Instance::waits_for_gil);
         let mut process = ProfileBuilderProcess::new(self, &name, pid, start, pack_threads);
-        if lane.iter().any(Instance::waits_for_gil) {
+        if gil_waiters {
             process.add_gil_wait_counter();
         }
         let mut previous_end = None;
@@ -900,6 +906,10 @@ pub struct FirefoxExportArguments {
     /// Whether to include bandwidth usage in the export
     #[arg(long, default_value_t = false)]
     bandwidth: bool,
+    /// Whether processes whose threads waited for the GIL get a track with the number of waiting
+    /// threads. Only Tachyon records the waits.
+    #[arg(long, default_value_t = false)]
+    gil_waiters: bool,
     /// Whether processes with the same parent and name that never run at the same time share a
     /// track. Recreated worker pools otherwise get a track per process.
     #[arg(long, value_enum, default_value_t = ProcessLanes::Auto)]
@@ -1154,8 +1164,12 @@ fn generate_fxprof(
     processes: HashMap<ReportIdentifier, Vec<JsonLine>>,
     args: &FirefoxExportArguments,
 ) -> Result<Profile, Whatever> {
-    let mut builder =
-        ProfileBuilder::from_samples(|| processes.values(), args.bandwidth, args.memory)?;
+    let mut builder = ProfileBuilder::from_samples(
+        || processes.values(),
+        args.bandwidth,
+        args.gil_waiters,
+        args.memory,
+    )?;
     let end_millis = processes.values().flatten().map(|it| it.time).max();
     let duration_millis = end_millis.unwrap_or_default() - builder.start_time_millis;
 
@@ -1291,6 +1305,7 @@ mod tests {
     fn args() -> FirefoxExportArguments {
         FirefoxExportArguments {
             bandwidth: true,
+            gil_waiters: true,
             lanes: ProcessLanes::Never,
             memory: MemoryMetric::Rss,
             data_dir: PathBuf::new(),
@@ -1907,6 +1922,29 @@ mod tests {
         );
         assert_eq!(leaf_frames(&json, "worker"), [work.clone(), wait, work]);
         assert_eq!(gil_wait_counts(&json, 1), Some(vec![0.0, 2.0, 1.0]));
+    }
+
+    #[test]
+    fn adds_the_gil_wait_track_only_if_asked_to() {
+        let samples = (0..2)
+            .map(|i| {
+                let mut waiting = stacktrace(2, "worker");
+                waiting.waiting_for_gil = true;
+                line(
+                    1000 + i * 100,
+                    vec![stacktrace(1, MAIN_THREAD_NAME), waiting],
+                    &[],
+                )
+            })
+            .collect();
+        let args = FirefoxExportArguments {
+            gil_waiters: false,
+            ..args()
+        };
+        let profile = generate_fxprof(HashMap::from([(ReportIdentifier::Pid(1), samples)]), &args);
+        let json = serde_json::to_value(profile.unwrap()).unwrap();
+
+        assert_eq!(gil_wait_counts(&json, 1), None);
     }
 
     #[test]

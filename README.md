@@ -177,6 +177,8 @@ Arguments:
 
 Options:
       --bandwidth        Whether to include bandwidth usage in the export
+      --gil-waiters      Whether processes whose threads waited for the GIL get a track with the
+                         number of waiting threads. Only Tachyon records the waits
       --lanes <LANES>    Whether processes with the same parent and name that never run at the same
                          time share a track. Recreated worker pools otherwise get a track per
                          process [default: auto] [possible values: auto, always, never]
