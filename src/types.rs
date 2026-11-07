@@ -65,6 +65,11 @@ pub struct ProcessResources {
     pub cpus: Option<u32>,
     pub disk_read_bytes: u64,
     pub disk_write_bytes: u64,
+    /// The bytes the process requested with read calls since it started (`rchar`). Unlike
+    /// `disk_read_bytes`, this includes reads served from the page cache, pipes and sockets. Only
+    /// recorded on Linux, missing in the global data and in profiles written by older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_read_call_bytes: Option<u64>,
     pub thread_resources: HashMap<u64, ThreadResources>,
 }
 
@@ -268,6 +273,7 @@ mod tests {
                 cpus: None,
                 disk_read_bytes: 0,
                 disk_write_bytes: 0,
+                total_read_call_bytes: None,
                 thread_resources: HashMap::new(),
             },
             index: 0,

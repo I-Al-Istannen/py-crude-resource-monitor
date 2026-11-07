@@ -3,7 +3,8 @@
 Finding: "Every worker reads the whole input". The workers all issue reads for the full file.
 Most of them are served by the page cache, so the profiler's disk counters (`read_bytes`, only
 what came from the storage device) show the file roughly once. Detecting this needs `rchar`, the
-bytes requested by read calls, which the profiler does not record yet. The ground truth has both.
+bytes requested by read calls, which the profiler records as `total_read_call_bytes`. The ground
+truth has both.
 Rule: sibling workers each read about the same, large number of bytes (by `rchar`).
 """
 
@@ -51,7 +52,7 @@ for result in results:
         {
             "name": f"worker {result['pid']} reads the whole input",
             **result,
-            "checks": [],
+            "checks": [{"type": "read_calls"}],
             "finding": "workers_reread_input",
         }
     )

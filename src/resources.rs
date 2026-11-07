@@ -190,6 +190,7 @@ impl SystemMeasurements {
             cpus: Some(cpus),
             disk_read_bytes: disk_usage.read_bytes,
             disk_write_bytes: disk_usage.written_bytes,
+            total_read_call_bytes: read_rchar(pid),
             thread_resources,
         })
     }
@@ -220,6 +221,7 @@ impl SystemMeasurements {
             cpus: None,
             disk_read_bytes,
             disk_write_bytes,
+            total_read_call_bytes: None,
             thread_resources: HashMap::new(),
         }
     }
@@ -373,6 +375,24 @@ fn read_pss(_pid: Pid) -> Option<u64> {
     None
 }
 
+/// Reads the bytes a process requested with read calls so far, including page cache hits
+#[cfg(target_os = "linux")]
+fn read_rchar(pid: Pid) -> Option<u64> {
+    let io = std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
+    parse_rchar(&io)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_rchar(_pid: Pid) -> Option<u64> {
+    None
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_rchar(io: &str) -> Option<u64> {
+    let line = io.lines().find(|it| it.starts_with("rchar:"))?;
+    line.split_whitespace().nth(1)?.parse::<u64>().ok()
+}
+
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_pss(rollup: &str) -> Option<u64> {
     let line = rollup.lines().find(|it| it.starts_with("Pss:"))?;
@@ -409,6 +429,21 @@ Pss_Dirty:        154004 kB
 ";
 
         assert_eq!(parse_pss(rollup), Some(157776 * 1024));
+    }
+
+    #[test]
+    fn parses_rchar_from_proc_io() {
+        let io = "\
+rchar: 268437913
+wchar: 1024
+syscr: 70
+syscw: 2
+read_bytes: 57671680
+write_bytes: 0
+cancelled_write_bytes: 0
+";
+
+        assert_eq!(parse_rchar(io), Some(268437913));
     }
 
     #[test]
