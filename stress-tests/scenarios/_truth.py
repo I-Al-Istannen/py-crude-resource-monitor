@@ -5,6 +5,7 @@ measured from inside the process (CPU time from the kernel, RSS/PSS from /proc),
 checks the suite should run against the profiler's samples for that time window.
 """
 
+import hashlib
 import json
 import os
 import threading
@@ -50,6 +51,31 @@ def burn_python(seconds: float) -> int:
     return counter
 
 
+_NATIVE_DATA = b"x" * (8 * MiB)
+
+
+def burn_native(seconds: float):
+    """Busy loop in C code that releases the GIL (hashing a large buffer)."""
+    deadline = time.perf_counter() + seconds
+    while time.perf_counter() < deadline:
+        hashlib.sha256(_NATIVE_DATA).digest()
+
+
+def thread_count(pid="self") -> int:
+    with open(f"/proc/{pid}/status") as f:
+        for line in f:
+            if line.startswith("Threads:"):
+                return int(line.split()[1])
+    raise RuntimeError("No Threads in status")
+
+
+def io_counters(pid="self") -> dict[str, int]:
+    """Bytes read and written: `rchar`/`wchar` count every read/write call, `read_bytes`/
+    `write_bytes` only what actually went to or came from the storage device."""
+    with open(f"/proc/{pid}/io") as f:
+        return {key: int(value) for key, value in (line.split(": ") for line in f)}
+
+
 def measure_thread(fn, *args) -> dict:
     """Runs `fn` on the current thread and returns the thread's own CPU time while doing so."""
     start, cpu_start = now_ms(), time.thread_time()
@@ -93,8 +119,11 @@ class Truth:
         time.sleep(1)
 
     @contextmanager
-    def phase(self, name: str, checks=(), pid=None):
+    def phase(self, name: str, checks=(), pid=None, finding=None):
+        """`finding` names what a viewer should detect in this phase (only for findings/)."""
         record = {"name": name, "pid": pid or os.getpid(), "checks": list(checks)}
+        if finding:
+            record["finding"] = finding
         cpu_start = time.process_time()
         record["start"] = now_ms()
         yield record
