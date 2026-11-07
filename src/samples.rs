@@ -463,6 +463,7 @@ mod tests {
                 cpus: None,
                 disk_read_bytes: 0,
                 disk_write_bytes: 0,
+                total_read_call_bytes: None,
                 thread_resources: HashMap::new(),
             },
             process: None,

@@ -444,6 +444,27 @@ def check_child_cpu(profile, truth, phase, check):
     )
 
 
+def check_read_calls(profile, truth, phase, check):
+    """Bytes requested by read calls, including page cache hits. The counter is a running total,
+    so we take the difference between the last sample before the phase and the first one after.
+    Processes can exit right after the phase, so we fall back to their last sample."""
+    samples = profile.processes.get(phase["pid"], [])
+    before = [s for s in samples if s["time"] <= phase["start"]]
+    after = [s for s in samples if s["time"] >= phase["end"]] or samples[-1:]
+    expected = phase["rchar"]
+    if not before or after[0] is before[-1]:
+        return FAIL, f"read calls of {mib(expected)}", "no samples around phase"
+    first, last = before[-1]["resources"], after[0]["resources"]
+    if "total_read_call_bytes" not in first:
+        return FAIL, f"read calls of {mib(expected)}", "not recorded"
+    measured = last["total_read_call_bytes"] - first["total_read_call_bytes"]
+    status = PASS if within(measured, expected, 4 * MiB, 0.05) else FAIL
+    # For comparison: the disk counters cover the interval before each sample
+    start, end = before[-1]["time"], after[0]["time"]
+    disk = sum(s["resources"]["disk_read_bytes"] for s in samples if start < s["time"] <= end)
+    return status, f"read calls of {mib(expected)}", f"{mib(measured)} (disk: {mib(disk)})"
+
+
 def check_global_cpu_delta(profile, truth, phase, check):
     baseline_phase = next(p for p in truth["phases"] if p["name"] == check["baseline"])
 
@@ -525,6 +546,7 @@ CHECKS = {
     "firefox_pss_total": check_firefox_pss_total,
     "shared_overcount": check_shared_overcount,
     "child_cpu": check_child_cpu,
+    "read_calls": check_read_calls,
     "global_cpu_delta": check_global_cpu_delta,
     "child_coverage": check_child_coverage,
     "firefox_lanes": check_firefox_lanes,
