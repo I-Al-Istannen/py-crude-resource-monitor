@@ -96,6 +96,50 @@ This builds `Dockerfile.realworld`, needs a few GiB and takes a few minutes. It 
 | `pytest_pandas`  | pandas' tests: memory use grows to over a GiB.                         |
 | `pip_install`    | A virtual environment and `pip install`: spawns many short programs.   |
 
+## Findings
+
+`findings/` holds reproducers for patterns the viewer should point out, such as a pool piling up
+results in the parent or threads oversubscribing the cores. Each one documents the finding and a
+rule a detector could use, and marks the phases where the pattern occurs with `finding=...`. They
+show up as `expected` rows in the summary until a detector exists. Where they make sense, they also
+run the regular checks, to make sure the profile contains the signal a detector needs.
+
+```bash
+./stress-tests/run.sh --findings                    # all of them, results in results/findings/
+./stress-tests/run.sh --findings off_cpu_waits      # a selection
+DOCKER_RUN_ARGS="--cpus 2.5" ./stress-tests/run.sh --findings cpu_quota
+DOCKER_RUN_ARGS="--memory 1g" ./stress-tests/run.sh --findings near_memory_limit
+```
+
+| Finding                   | Pattern                                                                                    |
+|---------------------------|--------------------------------------------------------------------------------------------|
+| `spike_between_stacks`    | A memory peak between two stack samples that show unrelated functions.                     |
+| `freed_not_returned`      | Fragmentation: most objects freed, RSS stays, the process idles where it did before.       |
+| `pool_results_pileup`     | `Pool.map` collects all results in the parent while its main thread waits.                 |
+| `pickle_big_args`         | Pool workers spend their time unpickling large arguments, the parent pickling them.        |
+| `temp_copy_peak`          | `deepcopy` briefly doubles the memory.                                                     |
+| `slow_teardown`           | Freeing a huge dict is a CPU burst lined up with a memory drop.                            |
+| `growth_per_iteration`    | Every iteration of the same loop leaves memory behind.                                     |
+| `oom_killed`              | A worker is SIGKILLed at its memory peak (sent by the parent, as the OOM killer would).    |
+| `near_memory_limit`       | Memory at 80% of the container limit. Needs `--memory`, records "no limit" otherwise.      |
+| `thread_oversubscription` | 4 workers x one thread per core: every thread gets a quarter of a core.                    |
+| `serialized_workers`      | Four workers share one lock and take turns, using one core together.                       |
+| `undersized_pool`         | 8 workers, 3 chunks of work: five workers idle throughout.                                 |
+| `off_cpu_waits`           | Waiting on the network, a lock, `sleep`, a subprocess and `select`, with almost no CPU.    |
+| `busy_polling`            | A full core spent polling `get_nowait`, then the same wait done with a blocking `get`.     |
+| `disk_bound`              | Writing and reading 1 GiB: low CPU, high disk throughput.                                  |
+| `workers_reread_input`    | Every worker reads the whole input. Mostly page-cache hits, so `read_bytes` hides it.      |
+| `cpu_quota`               | One thread per core under a CPU quota. Needs `--cpus`, records "no quota" otherwise.       |
+| `import_cost`             | A module that computes at import time, re-imported by every `spawn` worker.                |
+| `thread_leak`             | Every request starts a thread that never stops.                                            |
+| `subprocess_storm`        | 1000 tiny shell commands, each far shorter than a sampling interval.                       |
+| `lingering_children`      | A child outlives its job, a double-forked daemon is reparented out of the tree.            |
+| `slow_shutdown`           | Exit waits for a non-daemon thread, then for a slow `atexit` handler.                      |
+| `native_child_cpu`        | A busy non-Python child: CPU without stacks, by design rather than by failure.            |
+| `sampler_overload`        | 400 threads with deep stacks make sampling slower than the interval (with `--interval 20`). |
+| `sparse_stacks`           | CPU bursts shorter than a sampling interval.                                               |
+| `slow_patterns`           | `re` cache misses, `deepcopy`, eager `__repr__` in logging, `inspect.stack`, `json`, polars `map_elements`. |
+
 ## Adding a scenario
 
 Add a script to `scenarios/` using `Truth`, `truth.phase(name, checks=[...])` and `truth.save()`. See the `check_*` functions in `suite.py` for available checks and their ground-truth fields. Add any extra profiler arguments to `PROFILER_ARGS` there.

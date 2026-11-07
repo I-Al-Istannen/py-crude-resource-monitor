@@ -7,6 +7,10 @@ profiles it, then evaluates every check the scenario asked for against the recor
 - `pass`/`FAIL`: the profiler should get this right, a failure is a bug or regression
 - `limitation`: a known blind spot of sampling RSS and CPU, reproduced on purpose
 - `info`: a limitation check whose effect did not show up in this run (they are probabilistic)
+- `expected`: a pattern a viewer should point out in this phase (only for `--findings`)
+
+With `--findings`, it runs the scenarios in `findings/` instead: reproducers for the patterns the
+viewer should detect, with the phases where each one occurs.
 
 Only meaningful on Linux, as the ground truth is read from /proc.
 """
@@ -26,9 +30,10 @@ import zstandard
 
 HERE = Path(__file__).resolve().parent
 SCENARIOS = HERE / "scenarios"
+FINDINGS = HERE / "findings"
 MiB = 1024 * 1024
 
-PASS, FAIL, LIMITATION, INFO = "pass", "FAIL", "limitation", "info"
+PASS, FAIL, LIMITATION, INFO, EXPECTED = "pass", "FAIL", "limitation", "info", "expected"
 
 # Extra arguments for `profile` per scenario
 PROFILER_ARGS = {
@@ -528,7 +533,7 @@ CHECKS = {
 }
 
 
-def run_scenario(name: str, args, cpus: int) -> tuple[str, list[Result]]:
+def run_scenario(name: str, directory: Path, args, cpus: int) -> tuple[str, list[Result]]:
     output = args.output / name
     shutil.rmtree(output, ignore_errors=True)
     output.mkdir(parents=True)
@@ -539,14 +544,16 @@ def run_scenario(name: str, args, cpus: int) -> tuple[str, list[Result]]:
         "--interval", str(args.interval),
         "--output-dir", str(profile_dir),
         *PROFILER_ARGS.get(name, []),
-        "--", sys.executable, str(SCENARIOS / f"{name}.py"),
+        "--", sys.executable, str(directory / f"{name}.py"),
     ]  # fmt: skip
     environment = {
         **os.environ,
         "STRESS_TRUTH": str(truth_file),
         "RUST_LOG": "py_crude_resource_monitor=warn",
+        # For `_truth`, when running the scenarios in findings/
+        "PYTHONPATH": str(SCENARIOS),
     }
-    run = subprocess.run(command, cwd=SCENARIOS, env=environment, capture_output=True, text=True)
+    run = subprocess.run(command, cwd=directory, env=environment, capture_output=True, text=True)
     (output / "profiler.log").write_text(run.stdout + run.stderr)
     if run.returncode != 0 or not truth_file.exists():
         failure = Result("-", "run", FAIL, "exit code 0", f"exit code {run.returncode}")
@@ -564,6 +571,10 @@ def run_scenario(name: str, args, cpus: int) -> tuple[str, list[Result]]:
         for check in phase["checks"]:
             status, expected, measured = CHECKS[check["type"]](profile, truth, phase, check)
             results.append(Result(phase["name"], check["type"], status, expected, measured))
+        if "finding" in phase:
+            results.append(
+                Result(phase["name"], "finding", EXPECTED, phase["finding"], "no detector yet")
+            )
     for check in truth["checks"]:
         status, expected, measured = CHECKS[check["type"]](profile, truth, None, check)
         results.append(Result("whole run", check["type"], status, expected, measured))
@@ -580,12 +591,16 @@ def format_table(results: list[Result]) -> str:
 
 
 def main():
-    available = sorted(p.stem for p in SCENARIOS.glob("*.py") if not p.name.startswith("_"))
+    findings = "--findings" in sys.argv
+    directory = FINDINGS if findings else SCENARIOS
+    available = sorted(p.stem for p in directory.glob("*.py") if not p.name.startswith("_"))
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("scenarios", nargs="*", help=f"default: all of {', '.join(available)}")
+    parser.add_argument("--findings", action="store_true", help="run the scenarios in findings/")
     parser.add_argument("--binary", default="py-crude-resource-monitor")
     parser.add_argument("--interval", type=int, default=250, help="sampling interval in ms")
-    parser.add_argument("--output", type=Path, default=HERE / "results")
+    output = HERE / "results" / "findings" if findings else HERE / "results"
+    parser.add_argument("--output", type=Path, default=output)
     args = parser.parse_args()
     if unknown := set(args.scenarios) - set(available):
         parser.error(f"unknown scenarios: {', '.join(sorted(unknown))}")
@@ -595,7 +610,7 @@ def main():
     failed = False
     for name in args.scenarios or available:
         print(f"Running {name}...", file=sys.stderr, flush=True)
-        description, results = run_scenario(name, args, cpus)
+        description, results = run_scenario(name, directory, args, cpus)
         failed |= any(r.status == FAIL for r in results)
         section = f"## {name}\n\n{description.strip()}\n\n{format_table(results)}\n"
         print(section, flush=True)
