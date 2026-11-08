@@ -173,8 +173,23 @@ impl ProfileBuilder {
         Timestamp::from_millis_since_reference((millis - self.start_time_millis) as f64)
     }
 
-    fn cpu(&self, percent: f32) -> CpuDelta {
-        CpuDelta::from_millis(percent as f64 / 100. * self.interval_millis as f64)
+    /// The CPU time used at `percent` of one core for `window_millis`
+    fn cpu(&self, percent: f32, window_millis: u64) -> CpuDelta {
+        CpuDelta::from_millis(percent as f64 / 100. * window_millis as f64)
+    }
+
+    /// The time each sample's CPU usage was measured over, which is the time since the previous
+    /// sample of the same process. Ticks can be skipped, so it is not always the interval. The
+    /// first sample is assumed to cover one interval.
+    fn cpu_windows(&self, samples: &[JsonLine]) -> Vec<u64> {
+        std::iter::once(self.interval_millis)
+            .chain(
+                samples
+                    .windows(2)
+                    .map(|window| window[1].time.saturating_sub(window[0].time) as u64),
+            )
+            .take(samples.len())
+            .collect()
     }
 
     fn add_global(&mut self, samples: Vec<JsonLine>) -> Result<(), Whatever> {
@@ -446,8 +461,8 @@ impl<'a> ProfileBuilderProcess<'a> {
         self.parent.time(millis)
     }
 
-    fn cpu(&self, percent: f32) -> CpuDelta {
-        self.parent.cpu(percent)
+    fn cpu(&self, percent: f32, window_millis: u64) -> CpuDelta {
+        self.parent.cpu(percent, window_millis)
     }
 
     fn add_instance(&mut self, instance: Instance) -> Result<(), Whatever> {
@@ -487,10 +502,11 @@ impl<'a> ProfileBuilderProcess<'a> {
             }]
             .into_iter(),
         );
-        for line in samples {
+        let windows = self.parent.cpu_windows(&samples);
+        for (line, window) in samples.into_iter().zip(windows) {
             let timestamp = self.time(line.time);
             self.add_memory_samples(&line.memory_samples);
-            let cpu_delta = self.cpu(cpu(&line));
+            let cpu_delta = self.cpu(cpu(&line), window);
             self.parent
                 .profile
                 .add_sample(self.main_thread, timestamp, stack, cpu_delta, 1);
@@ -536,7 +552,8 @@ impl<'a> ProfileBuilderProcess<'a> {
 
     fn add_stack_samples(&mut self, samples: Vec<JsonLine>, main_thread_id: u64) {
         let thread_keys = self.thread_keys(&samples, main_thread_id);
-        for line in samples {
+        let windows = self.parent.cpu_windows(&samples);
+        for (line, window) in samples.into_iter().zip(windows) {
             let timestamp = self.time(line.time);
             self.add_memory_samples(&line.memory_samples);
             let gil_waiters = line.stacktraces.iter().filter(|it| it.waiting_for_gil);
@@ -633,7 +650,7 @@ impl<'a> ProfileBuilderProcess<'a> {
                 if thread != self.main_thread {
                     *self.parent.thread_cpu.entry(thread).or_default() += cpu as f64;
                 }
-                let cpu_delta = self.cpu(cpu);
+                let cpu_delta = self.cpu(cpu, window);
                 self.parent
                     .profile
                     .add_sample(thread, timestamp, stack, cpu_delta, 1);
@@ -1592,6 +1609,22 @@ mod tests {
         assert_eq!(
             thread_cpu_deltas(processes, "Process"),
             serde_json::json!([0, 0, 0])
+        );
+    }
+
+    #[test]
+    fn cpu_covers_the_time_since_the_previous_sample() {
+        // The profiler skipped two ticks before the last sample, its CPU covers all three
+        let threads = || vec![stacktrace(1, MAIN_THREAD_NAME), stacktrace(2, "worker")];
+        let samples = [1000, 1100, 1200, 1500]
+            .into_iter()
+            .map(|time| line(time, threads(), &[(2, 100.0)]))
+            .collect();
+        let processes = HashMap::from([(ReportIdentifier::Pid(1), samples)]);
+
+        assert_eq!(
+            thread_cpu_deltas(processes, "worker"),
+            serde_json::json!([100000, 100000, 100000, 300000])
         );
     }
 
