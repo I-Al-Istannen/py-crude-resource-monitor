@@ -587,6 +587,76 @@ fn packs_threads_with_the_same_name_that_never_overlap() {
     assert_eq!(thread_names(&json), ["Pool-#_#", "Pool-#_#", "python"]);
 }
 
+#[test]
+fn reused_thread_ids_of_different_os_threads_are_different_threads() {
+    let reused = |os_thread_id, name| {
+        let mut trace = stacktrace(2, name);
+        trace.os_thread_id = Some(os_thread_id);
+        trace
+    };
+    for lanes in [ProcessLanes::Never, ProcessLanes::Always] {
+        let mut samples = Vec::new();
+        for time in [1000, 1100, 1200] {
+            samples.push(line(
+                time,
+                vec![stacktrace(1, MAIN_THREAD_NAME), reused(2, "first")],
+                &[],
+            ));
+        }
+        for time in [1300, 1400, 1500] {
+            samples.push(line(
+                time,
+                vec![stacktrace(1, MAIN_THREAD_NAME), reused(3, "second")],
+                &[],
+            ));
+        }
+        let mut args = args();
+        args.lanes = lanes;
+
+        let profile =
+            generate_fxprof(HashMap::from([(ReportIdentifier::Pid(1), samples)]), &args).unwrap();
+        let json = serde_json::to_value(&profile).unwrap();
+
+        // The two threads never overlap, so lanes put them on the same track if named the same
+        assert_eq!(thread_names(&json), ["Process", "first", "second"]);
+    }
+}
+
+#[test]
+fn packed_threads_are_named_after_their_latest_name() {
+    let thread = |os_thread_id, name| {
+        let mut trace = stacktrace(2, name);
+        trace.os_thread_id = Some(os_thread_id);
+        trace
+    };
+    // A reused thread id carries the name of the previous thread in its first sample
+    let samples = vec![
+        line(
+            1000,
+            vec![stacktrace(1, MAIN_THREAD_NAME), thread(2, "old")],
+            &[],
+        ),
+        line(
+            1100,
+            vec![stacktrace(1, MAIN_THREAD_NAME), thread(2, "new")],
+            &[],
+        ),
+        line(
+            1200,
+            vec![stacktrace(1, MAIN_THREAD_NAME), thread(2, "new")],
+            &[],
+        ),
+    ];
+    let mut args = args();
+    args.lanes = ProcessLanes::Always;
+
+    let profile =
+        generate_fxprof(HashMap::from([(ReportIdentifier::Pid(1), samples)]), &args).unwrap();
+    let json = serde_json::to_value(&profile).unwrap();
+
+    assert_eq!(thread_names(&json), ["Process", "new"]);
+}
+
 /// The markers of the thread named `thread` as (name, start, end, data). Instant markers have
 /// no end, string fields are resolved.
 fn markers(

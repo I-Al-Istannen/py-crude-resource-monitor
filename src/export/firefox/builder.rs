@@ -2,7 +2,7 @@ use super::MemoryMetric;
 use super::lanes::{Instance, assign_lane};
 use super::markers::{ProcessLifetimeMarker, SkippedTicksMarker, StackCaptureFailedMarker};
 use super::normalize::memory_timeline;
-use crate::types::JsonLine;
+use crate::types::{JsonLine, StackTrace};
 use fxprof_processed_profile::{
     CategoryColor, CategoryHandle, CounterHandle, CpuDelta, Frame, FrameFlags, FrameInfo,
     GraphColor, MarkerTiming, ProcessHandle, Profile, ReferenceTimestamp, SamplingInterval,
@@ -417,12 +417,12 @@ impl<'a> ProfileBuilderProcess<'a> {
         &mut self,
         samples: &[JsonLine],
         main_thread_id: u64,
-    ) -> HashMap<u64, ThreadKey> {
+    ) -> HashMap<ThreadIdentity, ThreadKey> {
         if !self.pack_threads {
             return HashMap::new();
         }
         // The name and lifetime of each thread
-        let mut threads: HashMap<u64, (String, u128, u128)> = HashMap::new();
+        let mut threads: HashMap<ThreadIdentity, (String, u128, u128)> = HashMap::new();
         for line in samples {
             for stacktrace in &line.stacktraces {
                 if stacktrace.thread_id == main_thread_id {
@@ -430,8 +430,15 @@ impl<'a> ProfileBuilderProcess<'a> {
                 }
                 let name = normalize_thread_name(stacktrace.thread_name.as_deref());
                 threads
-                    .entry(stacktrace.thread_id)
-                    .and_modify(|(_, _, end)| *end = line.time)
+                    .entry(ThreadIdentity::of(stacktrace))
+                    .and_modify(|(known_name, _, end)| {
+                        // The first sample of a thread that reuses an id can still have the name of
+                        // the previous one
+                        if stacktrace.thread_name.is_some() {
+                            *known_name = name.clone();
+                        }
+                        *end = line.time;
+                    })
                     .or_insert((name, line.time, line.time));
             }
         }
@@ -464,10 +471,11 @@ impl<'a> ProfileBuilderProcess<'a> {
                 let thread = if stacktrace.thread_id == main_thread_id {
                     self.main_thread
                 } else {
+                    let identity = ThreadIdentity::of(&stacktrace);
                     let key = thread_keys
-                        .get(&stacktrace.thread_id)
+                        .get(&identity)
                         .cloned()
-                        .unwrap_or(ThreadKey::Id(stacktrace.thread_id));
+                        .unwrap_or(ThreadKey::Id(identity));
                     let thread = match self.threads.get(&key) {
                         Some(thread) => *thread,
                         None => {
@@ -750,9 +758,26 @@ impl ProfileCounter {
     }
 }
 
+/// Identifies a thread of a process. The `thread_id` is the address of the pthread, which a new
+/// thread reuses once the previous one exited, so the OS thread id has to tell them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct ThreadIdentity {
+    thread_id: u64,
+    os_thread_id: Option<u64>,
+}
+
+impl ThreadIdentity {
+    fn of(stacktrace: &StackTrace) -> Self {
+        Self {
+            thread_id: stacktrace.thread_id,
+            os_thread_id: stacktrace.os_thread_id,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum ThreadKey {
-    Id(u64),
+    Id(ThreadIdentity),
     /// A normalized thread name and the lane among threads with that name
     Lane(String, usize),
 }
