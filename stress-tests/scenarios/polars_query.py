@@ -37,7 +37,9 @@ with truth.phase(
         {
             "type": "native_thread",
             "library": "_polars_runtime",
-            "function": "polars_async::executor",
+            "thread": "async-executor",
+            # Rust paths, so the names are demangled
+            "function": "::",
         },
     ],
 ):

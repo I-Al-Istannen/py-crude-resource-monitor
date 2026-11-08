@@ -239,11 +239,16 @@ def check_firefox_thread_cpu(profile, truth, phase, check):
     """Per-thread CPU usage as shown by the Firefox Profiler export (`threadCPUDelta`)."""
     expected, measured, status = [], [], PASS
     for thread in phase["threads"]:
-        exported = next(
+        candidates = [
             t
             for t in profile.firefox_threads()
             if t["pid"] == str(phase["pid"])
             and (t["isMainThread"] if thread["name"] == "MainThread" else t["name"] == thread["name"])
+        ]
+        # Threads of different phases can have the same name, take the one that ran in this phase
+        exported = max(
+            candidates,
+            key=lambda t: sum(thread["start"] <= x <= thread["end"] for x in t["absolute_times"]),
         )
         times, deltas = exported["absolute_times"], exported["samples"]["threadCPUDelta"]
         cores = [
@@ -303,9 +308,12 @@ def check_native_stack(profile, truth, phase, check):
 
 def check_native_thread(profile, truth, phase, check):
     """Samples contain a thread without any Python frames that runs code from `library`. py-spy
-    only captures such threads with `--native all`. If given, one of the thread's frames must be
-    named like `function`, which also shows that the name was demangled."""
+    only captures such threads with `--native all`. If given, the thread's name must start with
+    `thread` and one of its frames must be named like `function`, which can show that the name was
+    demangled. Unwinding can stop early, so a name that is not the innermost frame is not reliable
+    on all platforms."""
     library, function = check["library"], check.get("function", "")
+    thread = check.get("thread", "")
     samples = profile.window(phase["pid"], phase["start"], phase["end"])
     if not samples:
         return FAIL, "samples in phase", "none"
@@ -313,7 +321,8 @@ def check_native_thread(profile, truth, phase, check):
     def native_only(trace):
         filenames = [frame["filename"] for frame in trace["frames"]]
         return (
-            not any(f.endswith(".py") for f in filenames)
+            (trace["thread_name"] or "").startswith(thread)
+            and not any(f.endswith(".py") for f in filenames)
             and any(library in f for f in filenames)
             and any(function in frame["name"] for frame in trace["frames"])
         )
@@ -322,8 +331,10 @@ def check_native_thread(profile, truth, phase, check):
     status = PASS if hits / len(samples) >= 0.9 else FAIL
     return (
         status,
-        f">= 90% of samples with a {library} thread without Python frames"
-        + (f" in {function}" if function else ""),
+        f">= 90% of samples with a {library} thread"
+        + (f" named {thread}*" if thread else "")
+        + " without Python frames"
+        + (f" and a frame named like {function!r}" if function else ""),
         f"{hits / len(samples):.0%} ({hits}/{len(samples)})",
     )
 
