@@ -357,7 +357,7 @@ fn run_profile(
     if let Err(e) = ctrlc::set_handler(move || quit_requested_clone.store(true, Ordering::Release))
     {
         warn!(
-            "Could not register CTRL+C termination handler: {}",
+            "Could not register the CTRL+C and SIGTERM handler: {}",
             Report::from_error(e)
         );
     }
