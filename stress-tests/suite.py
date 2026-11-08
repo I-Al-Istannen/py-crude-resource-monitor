@@ -737,6 +737,66 @@ def run_scenario(name: str, directory: Path, args, cpus: int) -> tuple[str, list
     return truth["description"], results
 
 
+EXIT_RACE_RUNS = 200
+EXIT_RACE_EXIT_CODE = 3
+EXIT_RACE_TIMEOUT_SECONDS = 30
+
+
+def run_exit_race(args) -> tuple[str, list[Result]]:
+    """Profiles a multi-threaded program that exits while the profiler samples it, many times.
+
+    The profiler stops the threads of a process to read their stacks. If the process exits at that
+    moment, releasing the threads or waiting for the process used to go wrong in a few percent of
+    the runs: the profiler could hang for good, or it lost the exit code of the program.
+    """
+    output = args.output / "exit_race"
+    shutil.rmtree(output, ignore_errors=True)
+    output.mkdir(parents=True)
+    command = [
+        args.binary, "profile", "py-spy", "--yes", "--interval", "10", "--memory-interval", "0",
+        "--output-dir", str(output / "profile"),
+        "--", sys.executable, str(SCENARIOS / "_exit_race_target.py"),
+    ]  # fmt: skip
+    environment = {**os.environ, "RUST_LOG": "py_crude_resource_monitor=warn"}
+    hangs, wrong_codes, failures = 0, [], []
+    for run in range(EXIT_RACE_RUNS):
+        try:
+            result = subprocess.run(
+                command,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=EXIT_RACE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            hangs += 1
+            failures.append(f"run {run}: hung")
+            continue
+        if result.returncode != EXIT_RACE_EXIT_CODE:
+            wrong_codes.append(result.returncode)
+            failures.append(f"run {run}: exit code {result.returncode}\n{result.stderr[-500:]}")
+    shutil.rmtree(output / "profile", ignore_errors=True)
+    (output / "failures.log").write_text("\n".join(failures))
+    runs = f"{EXIT_RACE_RUNS} runs"
+    return run_exit_race.__doc__, [
+        Result(
+            runs,
+            "no_hang",
+            PASS if hangs == 0 else FAIL,
+            f"no run takes over {EXIT_RACE_TIMEOUT_SECONDS} s",
+            f"{hangs} hung",
+        ),
+        Result(
+            runs,
+            "exit_code",
+            PASS if not wrong_codes else FAIL,
+            f"exit code {EXIT_RACE_EXIT_CODE} of the program every time",
+            f"{len(wrong_codes)} runs with another code"
+            + (f" ({sorted(set(wrong_codes))})" if wrong_codes else ""),
+        ),
+    ]
+
+
 def run_check(profile, truth, phase, check) -> Result:
     """Runs a check. A check that crashes, e.g. because the profile has no samples in a phase,
     fails instead of losing the results of all scenarios."""
@@ -761,6 +821,8 @@ def main():
     findings, realworld = "--findings" in sys.argv, "--realworld" in sys.argv
     directory = FINDINGS if findings else REALWORLD if realworld else SCENARIOS
     available = sorted(p.stem for p in directory.glob("*.py") if not p.name.startswith("_"))
+    if directory == SCENARIOS:
+        available.append("exit_race")
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("scenarios", nargs="*", help=f"default: all of {', '.join(available)}")
     parser.add_argument("--findings", action="store_true", help="run the scenarios in findings/")
@@ -786,7 +848,10 @@ def main():
     failed = False
     for name in args.scenarios or available:
         print(f"Running {name}...", file=sys.stderr, flush=True)
-        description, results = run_scenario(name, directory, args, cpus)
+        if name == "exit_race":
+            description, results = run_exit_race(args)
+        else:
+            description, results = run_scenario(name, directory, args, cpus)
         failed |= any(r.status == FAIL for r in results)
         section = f"## {name}\n\n{description.strip()}\n\n{format_table(results)}\n"
         print(section, flush=True)
