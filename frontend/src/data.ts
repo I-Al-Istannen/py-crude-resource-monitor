@@ -44,6 +44,9 @@ export const ProcessReportEntrySchema = z.object({
   // Set if capturing the stacktraces failed for this sample. Missing in older reports.
   stacktrace_error: z.string().nullish(),
   resources: ProcessResourceSchema,
+  // Set on the line written after the process exited, which only adds memory measured between
+  // two samples. Missing in older reports.
+  exited: z.boolean().optional(),
   index: z.number(),
   time: z.number(),
 });
@@ -114,6 +117,10 @@ export function parseJsonProcessReport(
       frames.push(StackFrameSchema.parse(json));
     } else {
       const entry = ProcessReportEntrySchema.parse(json);
+      // Its time is not a tick, so it would leave gaps in the graphs of all other processes
+      if (entry.exited) {
+        continue;
+      }
       for (const thread of entry.stacktraces) {
         if (thread.stack != null) {
           const resolved = stacks[thread.stack];

@@ -43,12 +43,17 @@ impl MemorySampler {
         })
     }
 
-    /// Sets the processes to sample. Samples of other processes are dropped.
-    pub fn set_pids(&self, pids: impl IntoIterator<Item = Pid>) {
+    /// Sets the processes to sample. Returns the samples of other processes that were not taken
+    /// yet, e.g. the ones from right before a process exited.
+    pub fn set_pids(&self, pids: impl IntoIterator<Item = Pid>) -> HashMap<Pid, Vec<MemorySample>> {
         let mut state = self.state.lock().unwrap();
         state.pids = pids.into_iter().collect();
         let State { pids, samples } = &mut *state;
-        samples.retain(|pid, _| pids.contains(pid));
+        samples
+            .extract_if(|pid, _| !pids.contains(pid))
+            .map(|(pid, mut recorder)| (pid, recorder.take(u128::MAX)))
+            .filter(|(_, samples)| !samples.is_empty())
+            .collect()
     }
 
     /// Removes and returns the recorded samples of `pid` taken before `until`
@@ -214,6 +219,23 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(memory, [10 * MIB, 11 * MIB, 12 * MIB, 13 * MIB, 14 * MIB]);
+    }
+
+    #[test]
+    fn returns_the_samples_of_removed_processes() {
+        let sampler = MemorySampler::new(Duration::from_secs(3600)).unwrap();
+        let (kept, removed) = (Pid::from_u32(1), Pid::from_u32(2));
+        {
+            let mut state = sampler.state.lock().unwrap();
+            for pid in [kept, removed] {
+                state.samples.entry(pid).or_default().add(sample(10, 0));
+            }
+        }
+
+        let leftovers = sampler.set_pids([kept]);
+
+        assert_eq!(leftovers, HashMap::from([(removed, vec![sample(10, 0)])]));
+        assert_eq!(sampler.take(kept, u128::MAX), [sample(10, 0)]);
     }
 
     #[test]

@@ -62,12 +62,15 @@ struct WriteRequest {
     memory_samples: Vec<MemorySample>,
     stacktraces: Vec<StackTrace>,
     stacktrace_error: Option<String>,
+    exited: bool,
     time: u128,
 }
 
 pub struct Tracker {
     /// The root process and its descendants that were alive during the last tick
     processes: HashMap<sysinfo::Pid, ProcessMetadata>,
+    /// The resources of each process in the last tick, without its threads
+    last_resources: HashMap<sysinfo::Pid, ProcessResources>,
     spies: StackSampler,
     system: SystemMeasurements,
     memory_sampler: Option<MemorySampler>,
@@ -112,6 +115,7 @@ impl Tracker {
 
         Ok(Self {
             processes,
+            last_resources: HashMap::new(),
             spies,
             system,
             memory_sampler,
@@ -126,15 +130,18 @@ impl Tracker {
 
     pub fn tick(&mut self) -> Result<(), TrackerError> {
         self.system.refresh();
-        let new_processes = self.update_processes();
-        if let Some(sampler) = &self.memory_sampler {
-            sampler.set_pids(self.processes.keys().copied());
-        }
+        let (new_processes, exited_processes) = self.update_processes();
+        let exit_memory_samples = match &self.memory_sampler {
+            Some(sampler) => sampler.set_pids(self.processes.keys().copied()),
+            None => HashMap::new(),
+        };
 
         let query_time = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_millis();
+
+        self.write_exit_memory_samples(exited_processes, exit_memory_samples)?;
 
         let mut traces = self
             .spies
@@ -159,6 +166,13 @@ impl Tracker {
                 Some(sampler) => sampler.take(*pid, query_time),
                 None => vec![],
             };
+            self.last_resources.insert(
+                *pid,
+                ProcessResources {
+                    thread_resources: HashMap::new(),
+                    ..info.clone()
+                },
+            );
             self.send(WriteRequest {
                 file_name: pid.to_string(),
                 resources: info,
@@ -166,6 +180,7 @@ impl Tracker {
                 memory_samples,
                 stacktraces,
                 stacktrace_error,
+                exited: false,
                 time: query_time,
             })?;
         }
@@ -178,13 +193,58 @@ impl Tracker {
             memory_samples: vec![],
             stacktraces: vec![],
             stacktrace_error: None,
+            exited: false,
             time: query_time,
         })
     }
 
+    /// Writes the memory measured between the previous tick and the exit of a process, which would
+    /// be lost otherwise. See [`JsonLine::exited`].
+    fn write_exit_memory_samples(
+        &mut self,
+        exited_processes: HashMap<sysinfo::Pid, ProcessMetadata>,
+        mut memory_samples: HashMap<sysinfo::Pid, Vec<MemorySample>>,
+    ) -> Result<(), TrackerError> {
+        for (pid, metadata) in exited_processes {
+            let last_resources = self.last_resources.remove(&pid);
+            let (Some(last_resources), Some(memory_samples)) =
+                (last_resources, memory_samples.remove(&pid))
+            else {
+                continue;
+            };
+            let Some(&last_sample) = memory_samples.last() else {
+                continue;
+            };
+            let resources = ProcessResources {
+                memory: last_sample.memory,
+                cpu: 0.0,
+                disk_read_bytes: 0,
+                disk_write_bytes: 0,
+                ..last_resources
+            };
+            self.send(WriteRequest {
+                file_name: pid.to_string(),
+                resources,
+                process: Some(metadata),
+                memory_samples,
+                stacktraces: vec![],
+                stacktrace_error: None,
+                exited: true,
+                time: last_sample.time,
+            })?;
+        }
+        Ok(())
+    }
+
     /// Updates the tracked processes to the ones still alive and their descendants.
-    /// Returns the processes that were not alive during the previous tick.
-    fn update_processes(&mut self) -> HashSet<sysinfo::Pid> {
+    /// Returns the processes that were not alive during the previous tick, and the ones that
+    /// exited since.
+    fn update_processes(
+        &mut self,
+    ) -> (
+        HashSet<sysinfo::Pid>,
+        HashMap<sysinfo::Pid, ProcessMetadata>,
+    ) {
         let current = self.system.process_tree(
             self.processes
                 .iter()
@@ -205,9 +265,11 @@ impl Tracker {
                 }
             }
         }
-        for pid in self.processes.keys() {
+        let mut exited_processes = HashMap::new();
+        for (pid, metadata) in &self.processes {
             if !current.contains_key(pid) {
                 info!("Tracked process {pid} exited");
+                exited_processes.insert(*pid, metadata.clone());
             }
         }
 
@@ -219,7 +281,7 @@ impl Tracker {
         );
         self.processes = current;
 
-        new_processes
+        (new_processes, exited_processes)
     }
 
     /// Queues a sample for writing. If this fails, the writer thread has stopped and [`Self::finish`]
@@ -286,6 +348,7 @@ fn write_samples(
                 resources: req.resources,
                 process: req.process,
                 memory_samples: req.memory_samples,
+                exited: req.exited,
                 index: *line_index,
                 time: req.time,
             };

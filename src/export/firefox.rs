@@ -507,8 +507,11 @@ impl<'a> ProfileBuilderProcess<'a> {
         );
         let windows = self.parent.cpu_windows(&samples);
         for (line, window) in samples.into_iter().zip(windows) {
-            let timestamp = self.time(line.time);
             self.add_memory_samples(&line.memory_samples);
+            if line.exited {
+                continue;
+            }
+            let timestamp = self.time(line.time);
             let cpu_delta = self.cpu(cpu(&line), window);
             self.parent
                 .profile
@@ -557,8 +560,11 @@ impl<'a> ProfileBuilderProcess<'a> {
         let thread_keys = self.thread_keys(&samples, main_thread_id);
         let windows = self.parent.cpu_windows(&samples);
         for (line, window) in samples.into_iter().zip(windows) {
-            let timestamp = self.time(line.time);
             self.add_memory_samples(&line.memory_samples);
+            if line.exited {
+                continue;
+            }
+            let timestamp = self.time(line.time);
             let gil_waiters = line.stacktraces.iter().filter(|it| it.waiting_for_gil);
             self.add_gil_wait_value(timestamp, gil_waiters.count());
 
@@ -1200,7 +1206,9 @@ fn generate_fxprof(
     for (identifier, samples) in &processes {
         if let ReportIdentifier::Pid(_) = identifier {
             for line in samples {
-                if let Some(pss) = line.resources.pss {
+                if let Some(pss) = line.resources.pss
+                    && !line.exited
+                {
                     *pss_totals.entry(line.time).or_default() += pss;
                 }
             }
@@ -1295,6 +1303,7 @@ mod tests {
         JsonLine {
             stacktraces,
             stacktrace_error: None,
+            exited: false,
             process: None,
             memory_samples: vec![],
             resources: ProcessResources {
@@ -1630,6 +1639,44 @@ mod tests {
             thread_cpu_deltas(processes, "worker"),
             serde_json::json!([100000, 100000, 100000, 300000])
         );
+    }
+
+    #[test]
+    fn exit_lines_only_add_their_memory_samples() {
+        let mut samples = (0..3)
+            .map(|i| line(1000 + i * 100, vec![stacktrace(1, MAIN_THREAD_NAME)], &[]))
+            .collect::<Vec<_>>();
+        let mut exit = line(1250, vec![], &[]);
+        exit.exited = true;
+        exit.memory_samples = vec![
+            MemorySample {
+                time: 1230,
+                memory: 4096,
+            },
+            MemorySample {
+                time: 1250,
+                memory: 2048,
+            },
+        ];
+        samples.push(exit);
+        let processes = HashMap::from([(ReportIdentifier::Pid(1), samples)]);
+
+        let profile = generate_fxprof(processes, &args()).unwrap();
+        let json = serde_json::to_value(&profile).unwrap();
+
+        let thread = &json["threads"][0];
+        assert_eq!(thread["samples"]["length"], 3);
+        let memory = json["counters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|it| it["category"] == "Memory")
+            .unwrap();
+        // The initial zero, three samples and the two measurements before the exit
+        let counts = memory["samples"]["count"].as_array().unwrap();
+        let total = counts.iter().map(|it| it.as_f64().unwrap()).sum::<f64>();
+        assert_eq!(counts.len(), 6);
+        assert_eq!(total, 2048.0);
     }
 
     #[test]

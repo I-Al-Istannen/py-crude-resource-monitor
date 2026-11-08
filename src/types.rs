@@ -21,6 +21,11 @@ pub struct JsonLine<S = StackTrace> {
     /// Only contains changes, see [`crate::memory_sampler`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub memory_samples: Vec<MemorySample>,
+    /// Set on the line written after the process exited. It only has the memory measured between
+    /// the previous sample and the exit, `time` is the last of these measurements. Its resources
+    /// are the previous sample's, with the last measured memory and no CPU usage.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exited: bool,
     pub index: usize,
     pub time: u128,
 }
@@ -262,6 +267,7 @@ mod tests {
     #[test]
     fn omits_missing_stacktrace_error() {
         let line: JsonLine = JsonLine {
+            exited: false,
             stacktraces: vec![],
             stacktrace_error: None,
             process: None,

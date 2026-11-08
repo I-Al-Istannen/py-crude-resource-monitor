@@ -339,6 +339,7 @@ impl SampleReader {
                 resources: sample.resources,
                 process: sample.process,
                 memory_samples: sample.memory_samples,
+                exited: sample.exited,
                 index: sample.index,
                 time: sample.time,
             });
@@ -456,6 +457,7 @@ mod tests {
         JsonLine {
             stacktraces,
             stacktrace_error: None,
+            exited: false,
             resources: ProcessResources {
                 memory: 1,
                 pss: None,
