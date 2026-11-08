@@ -26,15 +26,20 @@ pub(super) struct WriteRequest {
 /// file descriptor limit
 const MAX_OPEN_FILES: usize = 64;
 
+/// Persists across file-handle eviction so indices and interned stacks stay valid.
+#[derive(Default)]
+struct FileState {
+    next_index: usize,
+    stacks: StackTable,
+}
+
 pub(super) fn write_samples(
     rx: mpsc::Receiver<WriteRequest>,
     output_dir: PathBuf,
     compress: bool,
 ) -> Result<(), TrackerError> {
     let mut open_files: HashMap<String, SampleFile> = HashMap::new();
-    let mut line_indices: HashMap<String, usize> = HashMap::new();
-    // Kept when closing files, the frames and stacks in them stay valid
-    let mut stack_tables: HashMap<String, StackTable> = HashMap::new();
+    let mut file_states: HashMap<String, FileState> = HashMap::new();
 
     let result = (|| {
         while let Ok(req) = rx.recv() {
@@ -53,13 +58,12 @@ pub(super) fn write_samples(
                         .context(WriteSamplesSnafu { path: path.clone() })?,
                 ),
             };
-            let line_index = line_indices.entry(name.clone()).or_insert(0);
-            let stack_table = stack_tables.entry(name).or_default();
+            let state = file_states.entry(name).or_default();
 
             let stacktraces = req
                 .stacktraces
                 .into_iter()
-                .map(|trace| stack_table.store(trace, &mut *file))
+                .map(|trace| state.stacks.store(trace, &mut *file))
                 .collect::<Result<_, _>>()
                 .context(SerializeSampleSnafu)?;
             let line = JsonLine {
@@ -69,14 +73,14 @@ pub(super) fn write_samples(
                 process: req.process,
                 memory_samples: req.memory_samples,
                 exited: req.exited,
-                index: *line_index,
+                index: state.next_index,
                 time: req.time,
             };
             // The frames and stacks of the sample are flushed with it, so the file stays readable
             write_line(&mut *file, &line).context(SerializeSampleSnafu)?;
             file.flush_lines().context(WriteSamplesSnafu { path })?;
 
-            *line_index += 1;
+            state.next_index += 1;
         }
         Ok(())
     })();
