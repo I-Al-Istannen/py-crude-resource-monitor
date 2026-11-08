@@ -59,10 +59,8 @@ pub struct ProcessMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadResources {
+    /// CPU usage relative to one core (100% means one fully busy core).
     pub cpu: f32,
-    pub memory: u64,
-    pub disk_read_bytes: u64,
-    pub disk_write_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,10 +70,10 @@ pub struct ProcessResources {
     /// between them. Only recorded on Linux if requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pss: Option<u64>,
-    /// Divided by the number of cores, so 100% means all cores are fully used
+    /// CPU usage relative to one core, just like thread CPU.
+    #[serde(rename = "cpu_core_percent")]
     pub cpu: f32,
-    /// The number of cores `cpu` was divided by. Missing in the global data and in profiles
-    /// written by older versions.
+    /// Core count for displays that normalize CPU usage to the whole machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpus: Option<u32>,
     pub disk_read_bytes: u64,
@@ -266,8 +264,8 @@ mod tests {
 
     #[test]
     fn reads_lines_without_stacktrace_error() {
-        // Written by versions before `stacktrace_error` existed
-        let line = r#"{"stacktraces":[],"resources":{"memory":1,"cpu":2.0,"disk_read_bytes":0,"disk_write_bytes":0,"thread_resources":{}},"index":0,"time":1000}"#;
+        // Stack capture errors are optional.
+        let line = r#"{"stacktraces":[],"resources":{"memory":1,"cpu_core_percent":2.0,"disk_read_bytes":0,"disk_write_bytes":0,"thread_resources":{}},"index":0,"time":1000}"#;
 
         let line: JsonLine<StoredStackTrace> = serde_json::from_str(line).unwrap();
 

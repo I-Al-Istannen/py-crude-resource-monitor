@@ -129,8 +129,7 @@ class Profile:
         return [s for s in samples if start + 2 * self.interval <= s["time"] <= end]
 
     def process_cores(self, sample: dict) -> float:
-        # Process CPU is normalized to all cores (100% = every core busy)
-        return sample["resources"]["cpu"] * self.cpus / 100
+        return sample["resources"]["cpu_core_percent"] / 100
 
     @staticmethod
     def thread_cores(sample: dict, native_id: int) -> float | None:

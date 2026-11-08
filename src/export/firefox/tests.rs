@@ -44,17 +44,7 @@ fn line(time: u128, stacktraces: Vec<StackTrace>, thread_cpu: &[(u64, f32)]) -> 
             total_read_call_bytes: None,
             thread_resources: thread_cpu
                 .iter()
-                .map(|&(id, cpu)| {
-                    (
-                        id,
-                        ThreadResources {
-                            cpu,
-                            memory: 0,
-                            disk_read_bytes: 0,
-                            disk_write_bytes: 0,
-                        },
-                    )
-                })
+                .map(|&(id, cpu)| (id, ThreadResources { cpu }))
                 .collect(),
         },
         index: 0,
@@ -321,17 +311,52 @@ fn thread_cpu_deltas(
 }
 
 #[test]
-fn main_thread_falls_back_to_undivided_process_cpu() {
-    // No per-thread data at all, like on macOS: 50% of 4 cores is two full cores
+fn main_thread_falls_back_to_process_cpu() {
+    // No per-thread data: process CPU already uses the same units as thread CPU.
     let samples = (0..3)
         .map(|i| {
             let mut line = line(1000 + i * 100, vec![stacktrace(1, MAIN_THREAD_NAME)], &[]);
             line.resources.cpus = Some(4);
+            line.resources.cpu = 200.0;
             line
         })
         .collect();
     let processes = HashMap::from([(ReportIdentifier::Pid(1), samples)]);
 
+    assert_eq!(
+        thread_cpu_deltas(processes, "Process"),
+        serde_json::json!([200000, 200000, 200000])
+    );
+}
+
+#[test]
+fn global_cpu_is_displayed_as_a_machine_percentage() {
+    let samples = (0..3)
+        .map(|i| {
+            let mut sample = line(1000 + i * 100, vec![], &[]);
+            sample.resources.cpu = 200.0;
+            sample.resources.cpus = Some(4);
+            sample
+        })
+        .collect();
+    let processes = HashMap::from([(ReportIdentifier::Global, samples)]);
+    assert_eq!(
+        thread_cpu_deltas(processes, "Global"),
+        serde_json::json!([50000, 50000, 50000])
+    );
+}
+
+#[test]
+fn resource_only_process_cpu_uses_core_units() {
+    let samples = (0..3)
+        .map(|i| {
+            let mut sample = line(1000 + i * 100, vec![], &[]);
+            sample.resources.cpu = 200.0;
+            sample.resources.cpus = Some(4);
+            sample
+        })
+        .collect();
+    let processes = HashMap::from([(ReportIdentifier::Pid(1), samples)]);
     assert_eq!(
         thread_cpu_deltas(processes, "Process"),
         serde_json::json!([200000, 200000, 200000])

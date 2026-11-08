@@ -161,7 +161,9 @@ impl ProfileBuilder {
         // Every tick writes a global sample, so gaps in them are ticks the profiler skipped
         process.add_skipped_ticks_markers(&samples);
         // Global CPU is meant to be divided by the number of cores, 100% means all cores are busy
-        process.add_label_samples("Global", samples, |line| line.resources.cpu);
+        process.add_label_samples("Global", samples, |line| {
+            line.resources.cpu / line.resources.cpus.unwrap_or(1) as f32
+        });
         process.finish(end);
     }
 
@@ -374,11 +376,8 @@ impl<'a> ProfileBuilderProcess<'a> {
                 instance.name()
             );
             let label = instance.name().to_string();
-            // Without threads, all CPU usage belongs to the main thread. Undo the division by the
-            // number of cores, as thread CPU is relative to one core.
-            self.add_label_samples(&label, instance.samples, |line| {
-                line.resources.cpu * line.resources.cpus.unwrap_or(1) as f32
-            });
+            // Without threads, all CPU usage belongs to the main thread.
+            self.add_label_samples(&label, instance.samples, |line| line.resources.cpu);
         }
     }
 
@@ -540,12 +539,11 @@ impl<'a> ProfileBuilderProcess<'a> {
                 let cpu = match thread_resources {
                     Some(resources) => resources.cpu,
                     // Per-thread data is not available on all platforms, so we attribute the
-                    // whole process to the main thread as a fallback. The process CPU is divided
-                    // by the number of cores, thread CPU is not.
+                    // whole process to the main thread as a fallback.
                     None if thread == self.main_thread
                         && line.resources.thread_resources.is_empty() =>
                     {
-                        line.resources.cpu * line.resources.cpus.unwrap_or(1) as f32
+                        line.resources.cpu
                     }
                     None => 0.0,
                 };
