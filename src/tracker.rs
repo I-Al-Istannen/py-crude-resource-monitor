@@ -65,8 +65,6 @@ pub struct RecordingOptions {
 pub struct Tracker {
     /// The root process and its descendants that were alive during the last tick
     processes: HashMap<sysinfo::Pid, ProcessMetadata>,
-    /// The resources of each process in the last tick, without its threads
-    last_resources: HashMap<sysinfo::Pid, ProcessResources>,
     spies: StackSampler,
     system: SystemMeasurements,
     memory_sampler: Option<MemorySampler>,
@@ -104,7 +102,6 @@ impl Tracker {
 
         Ok(Self {
             processes,
-            last_resources: HashMap::new(),
             spies,
             system,
             memory_sampler,
@@ -159,13 +156,6 @@ impl Tracker {
                 Some(sampler) => sampler.take(*pid, query_time),
                 None => vec![],
             };
-            self.last_resources.insert(
-                *pid,
-                ProcessResources {
-                    thread_resources: HashMap::new(),
-                    ..info.clone()
-                },
-            );
             self.send(WriteRequest {
                 file_name: pid.to_string(),
                 resources: info,
@@ -199,10 +189,7 @@ impl Tracker {
         mut memory_samples: HashMap<sysinfo::Pid, Vec<MemorySample>>,
     ) -> Result<(), TrackerError> {
         for (pid, metadata) in exited_processes {
-            let last_resources = self.last_resources.remove(&pid);
-            let (Some(last_resources), Some(memory_samples)) =
-                (last_resources, memory_samples.remove(&pid))
-            else {
+            let Some(memory_samples) = memory_samples.remove(&pid) else {
                 continue;
             };
             let Some(&last_sample) = memory_samples.last() else {
@@ -213,7 +200,10 @@ impl Tracker {
                 cpu: 0.0,
                 disk_read_bytes: 0,
                 disk_write_bytes: 0,
-                ..last_resources
+                pss: None,
+                cpus: None,
+                total_read_call_bytes: None,
+                thread_resources: HashMap::new(),
             };
             self.send(WriteRequest {
                 file_name: pid.to_string(),
