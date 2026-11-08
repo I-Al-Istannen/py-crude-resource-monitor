@@ -22,8 +22,8 @@ pub struct JsonLine<S = StackTrace> {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub memory_samples: Vec<MemorySample>,
     /// Set on the line written after the process exited. It only has the memory measured between
-    /// the previous sample and the exit, `time` is the last of these measurements. Its resources
-    /// are the previous sample's, with the last measured memory and no CPU usage.
+    /// the previous sample and the exit, `time` is the last of these measurements. Only memory
+    /// is populated in its resources; other fields are empty placeholders.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exited: bool,
     pub index: usize,
