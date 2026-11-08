@@ -1,7 +1,8 @@
 use super::MemoryMetric;
 use super::lanes::{Instance, assign_lane};
 use super::markers::{ProcessLifetimeMarker, SkippedTicksMarker, StackCaptureFailedMarker};
-use crate::types::{JsonLine, MemorySample, ProcessResources};
+use super::normalize::memory_timeline;
+use crate::types::JsonLine;
 use fxprof_processed_profile::{
     CategoryColor, CategoryHandle, CounterHandle, CpuDelta, Frame, FrameFlags, FrameInfo,
     GraphColor, MarkerTiming, ProcessHandle, Profile, ReferenceTimestamp, SamplingInterval,
@@ -11,7 +12,6 @@ use log::info;
 use snafu::{OptionExt, Whatever};
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::marker::PhantomData;
 
 pub(super) const MAIN_THREAD_NAME: &str = "MainThread";
 pub(super) const CATEGORY_PYTHON_NAME: &str = "Python";
@@ -70,7 +70,7 @@ impl ProfileBuilder {
 
     fn start_time(samples: impl Iterator<Item = impl Borrow<JsonLine>>) -> Result<u128, Whatever> {
         samples
-            .map(|it| it.borrow().time)
+            .map(|it| it.borrow().earliest_time())
             .min()
             .whatever_context("no samples found")
     }
@@ -270,7 +270,7 @@ struct ProfileBuilderProcess<'a> {
     /// For packed threads, the end of each lane per normalized thread name
     thread_lane_ends: HashMap<String, Vec<u128>>,
     thread_end_times: HashMap<ThreadHandle, Timestamp>,
-    memory_counter: ProfileCounter<Initialized>,
+    memory_counter: ProfileCounter,
     /// Unlike the memory, the I/O is recorded as the bytes since the previous sample, so its
     /// samples are the values themselves
     io_counter: Option<CounterHandle>,
@@ -316,8 +316,8 @@ impl<'a> ProfileBuilderProcess<'a> {
                 MemoryMetric::Pss => "Proportional set size (PSS)",
             },
             GraphColor::Orange,
-        )
-        .initialize(&mut parent.profile, start_timestamp, 0.);
+            start_timestamp,
+        );
         let io_counter = if parent.include_bandwidth {
             Some(
                 ProfileCounter::new(
@@ -327,8 +327,8 @@ impl<'a> ProfileBuilderProcess<'a> {
                     "Bandwidth",
                     "I/O read/write in bytes",
                     GraphColor::Teal,
+                    start_timestamp,
                 )
-                .initialize(&mut parent.profile, start_timestamp, 0.)
                 .handle,
             )
         } else {
@@ -409,9 +409,9 @@ impl<'a> ProfileBuilderProcess<'a> {
             }]
             .into_iter(),
         );
+        self.add_memory_timeline(&samples);
         let windows = self.parent.cpu_windows(&samples);
         for (line, window) in samples.into_iter().zip(windows) {
-            self.add_memory_samples(&line.memory_samples);
             if line.exited {
                 continue;
             }
@@ -420,7 +420,10 @@ impl<'a> ProfileBuilderProcess<'a> {
             self.parent
                 .profile
                 .add_sample(self.main_thread, timestamp, stack, cpu_delta, 1);
-            self.add_counter_values(timestamp, &line.resources);
+            self.add_bandwidth_value(
+                timestamp,
+                line.resources.disk_read_bytes + line.resources.disk_write_bytes,
+            );
         }
     }
 
@@ -462,9 +465,9 @@ impl<'a> ProfileBuilderProcess<'a> {
 
     fn add_stack_samples(&mut self, samples: Vec<JsonLine>, main_thread_id: u64) {
         let thread_keys = self.thread_keys(&samples, main_thread_id);
+        self.add_memory_timeline(&samples);
         let windows = self.parent.cpu_windows(&samples);
         for (line, window) in samples.into_iter().zip(windows) {
-            self.add_memory_samples(&line.memory_samples);
             if line.exited {
                 continue;
             }
@@ -569,34 +572,24 @@ impl<'a> ProfileBuilderProcess<'a> {
                     .add_sample(thread, timestamp, stack, cpu_delta, 1);
             }
 
-            self.add_counter_values(timestamp, &line.resources);
-        }
-    }
-
-    fn add_counter_values(&mut self, timestamp: Timestamp, resources: &ProcessResources) {
-        let memory = match self.parent.memory {
-            MemoryMetric::Rss => resources.memory,
-            // The global data has no PSS, and processes might not have it for every sample
-            MemoryMetric::Pss => resources.pss.unwrap_or(resources.memory),
-        };
-        self.memory_counter
-            .add_value(&mut self.parent.profile, timestamp, memory as f64);
-        if let Some(io_counter) = self.io_counter {
-            self.parent.profile.add_counter_sample(
-                io_counter,
+            self.add_bandwidth_value(
                 timestamp,
-                (resources.disk_read_bytes + resources.disk_write_bytes) as f64,
-                1,
+                line.resources.disk_read_bytes + line.resources.disk_write_bytes,
             );
         }
     }
 
-    /// Adds the memory measured between two samples. They only contain the RSS.
-    fn add_memory_samples(&mut self, samples: &[MemorySample]) {
-        if self.parent.memory != MemoryMetric::Rss {
-            return;
+    fn add_bandwidth_value(&mut self, timestamp: Timestamp, bytes: u64) {
+        if let Some(io_counter) = self.io_counter {
+            self.parent
+                .profile
+                .add_counter_sample(io_counter, timestamp, bytes as f64, 1);
         }
-        for sample in samples {
+    }
+
+    /// Convert absolute memory measurements to deltas only after ordering the full timeline.
+    fn add_memory_timeline(&mut self, samples: &[JsonLine]) {
+        for sample in memory_timeline(samples, self.parent.memory) {
             let timestamp = self.time(sample.time);
             self.memory_counter.add_value(
                 &mut self.parent.profile,
@@ -617,19 +610,9 @@ impl<'a> ProfileBuilderProcess<'a> {
     fn reset_counters(&mut self, millis: u128) {
         let timestamp = self.time(millis);
         self.add_gil_wait_value(timestamp, 0);
-        self.add_counter_values(
-            timestamp,
-            &ProcessResources {
-                memory: 0,
-                pss: None,
-                cpu: 0.0,
-                cpus: None,
-                disk_read_bytes: 0,
-                disk_write_bytes: 0,
-                total_read_call_bytes: None,
-                thread_resources: HashMap::new(),
-            },
-        );
+        self.memory_counter
+            .add_value(&mut self.parent.profile, timestamp, 0.0);
+        self.add_bandwidth_value(timestamp, 0);
     }
 
     /// Marks when a process was alive. This tells processes sharing a track apart, and lists all
@@ -783,14 +766,13 @@ fn main_thread_id(samples: &[JsonLine]) -> Result<u64, Whatever> {
     Ok(main_thread_id)
 }
 
-struct Initialized;
-struct ProfileCounter<T> {
+/// Adapts absolute measurements to the deltas Firefox counters store.
+struct ProfileCounter {
     handle: CounterHandle,
     last_value: f64,
-    _marker: PhantomData<T>,
 }
 
-impl ProfileCounter<()> {
+impl ProfileCounter {
     fn new(
         profile: &mut Profile,
         process: ProcessHandle,
@@ -798,34 +780,17 @@ impl ProfileCounter<()> {
         category: &str,
         description: &str,
         color: GraphColor,
+        start: Timestamp,
     ) -> Self {
         let handle = profile.add_counter(process, name, category, description);
         profile.set_counter_color(handle, color);
+        profile.add_counter_sample(handle, start, 0.0, 1);
         Self {
             handle,
             last_value: 0.0,
-            _marker: PhantomData,
         }
     }
 
-    /// Sets the initial value of the counter. All other values are relative to this value.
-    /// Set this to zero if you want to start counting from zero.
-    fn initialize(
-        self,
-        profile: &mut Profile,
-        timestamp: Timestamp,
-        value: f64,
-    ) -> ProfileCounter<Initialized> {
-        profile.add_counter_sample(self.handle, timestamp, value, 1);
-        ProfileCounter {
-            handle: self.handle,
-            last_value: value,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl ProfileCounter<Initialized> {
     fn add_value(&mut self, profile: &mut Profile, timestamp: Timestamp, value: f64) {
         let delta = value - self.last_value;
         self.last_value = value;

@@ -29,7 +29,11 @@ impl Instance {
     }
 
     pub(super) fn start(&self) -> u128 {
-        self.samples[0].time
+        self.samples
+            .iter()
+            .map(JsonLine::earliest_time)
+            .min()
+            .unwrap()
     }
 
     pub(super) fn end(&self) -> u128 {
