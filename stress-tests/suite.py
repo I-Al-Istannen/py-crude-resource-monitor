@@ -122,6 +122,8 @@ class Profile:
         thread never has one, so we skip the first two intervals.
         """
         samples = self.global_samples if pid == "global" else self.processes.get(pid, [])
+        # Lines written after a process exited have no measurement interval
+        samples = [s for s in samples if not s.get("exited")]
         return [s for s in samples if start + 2 * self.interval <= s["time"] <= end]
 
     def process_cores(self, sample: dict) -> float:
