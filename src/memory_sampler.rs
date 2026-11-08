@@ -23,7 +23,7 @@ pub struct MemorySampler {
 
 #[derive(Default)]
 struct State {
-    pids: Vec<Pid>,
+    processes: HashMap<Pid, u64>,
     samples: HashMap<Pid, Recorder>,
 }
 
@@ -44,13 +44,17 @@ impl MemorySampler {
     }
 
     /// Sets the processes to sample. Returns the samples of other processes that were not taken
-    /// yet, e.g. the ones from right before a process exited.
-    pub fn set_pids(&self, pids: impl IntoIterator<Item = Pid>) -> HashMap<Pid, Vec<MemorySample>> {
+    /// yet, e.g. the ones from right before a process exited. A changed start time replaces the
+    /// process even when its PID stays the same.
+    pub fn set_processes(
+        &self,
+        processes: impl IntoIterator<Item = (Pid, u64)>,
+    ) -> HashMap<Pid, Vec<MemorySample>> {
         let mut state = self.state.lock().unwrap();
-        state.pids = pids.into_iter().collect();
-        let State { pids, samples } = &mut *state;
+        let previous = std::mem::replace(&mut state.processes, processes.into_iter().collect());
+        let State { processes, samples } = &mut *state;
         samples
-            .extract_if(|pid, _| !pids.contains(pid))
+            .extract_if(|pid, _| previous.get(pid) != processes.get(pid))
             .map(|(pid, mut recorder)| (pid, recorder.take(u128::MAX)))
             .filter(|(_, samples)| !samples.is_empty())
             .collect()
@@ -83,7 +87,8 @@ fn sample(
 ) {
     let mut next = Instant::now();
     loop {
-        let pids = state.lock().unwrap().pids.clone();
+        let processes = state.lock().unwrap().processes.clone();
+        let pids = processes.keys().copied().collect::<Vec<_>>();
         if !pids.is_empty() {
             system.refresh_processes_specifics(
                 ProcessesToUpdate::Some(&pids),
@@ -102,7 +107,9 @@ fn sample(
                     continue;
                 };
                 // The pid might have been removed while we were measuring
-                if !state.pids.contains(pid) {
+                if state.processes.get(pid) != processes.get(pid)
+                    || processes.get(pid) != Some(&process.start_time())
+                {
                     continue;
                 }
                 let sample = MemorySample {
@@ -228,14 +235,45 @@ mod tests {
         {
             let mut state = sampler.state.lock().unwrap();
             for pid in [kept, removed] {
+                state.processes.insert(pid, 1);
                 state.samples.entry(pid).or_default().add(sample(10, 0));
             }
         }
 
-        let leftovers = sampler.set_pids([kept]);
+        let leftovers = sampler.set_processes([(kept, 1)]);
 
         assert_eq!(leftovers, HashMap::from([(removed, vec![sample(10, 0)])]));
         assert_eq!(sampler.take(kept, u128::MAX), [sample(10, 0)]);
+    }
+
+    #[test]
+    fn replaces_the_recorder_when_a_pid_is_reused() {
+        let sampler = MemorySampler::new(Duration::from_secs(3600)).unwrap();
+        let pid = Pid::from_u32(u32::MAX);
+        {
+            let mut state = sampler.state.lock().unwrap();
+            state.processes.insert(pid, 1);
+            let recorder = state.samples.entry(pid).or_default();
+            recorder.add(sample(10, 100 * MIB));
+            recorder.add(sample(20, 100 * MIB));
+        }
+
+        let leftovers = sampler.set_processes([(pid, 2)]);
+        assert_eq!(
+            leftovers,
+            HashMap::from([(pid, vec![sample(10, 100 * MIB)])])
+        );
+        assert!(sampler.take(pid, u128::MAX).is_empty());
+        // A fresh baseline is recorded even if it matches the old process's memory.
+        sampler
+            .state
+            .lock()
+            .unwrap()
+            .samples
+            .entry(pid)
+            .or_default()
+            .add(sample(30, 100 * MIB));
+        assert_eq!(sampler.take(pid, u128::MAX), [sample(30, 100 * MIB)]);
     }
 
     #[test]

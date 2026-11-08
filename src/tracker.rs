@@ -126,7 +126,11 @@ impl Tracker {
         self.system.refresh();
         let (new_processes, exited_processes) = self.update_processes();
         let exit_memory_samples = match &self.memory_sampler {
-            Some(sampler) => sampler.set_pids(self.processes.keys().copied()),
+            Some(sampler) => sampler.set_processes(
+                self.processes
+                    .iter()
+                    .map(|(pid, metadata)| (*pid, metadata.start_time)),
+            ),
             None => HashMap::new(),
         };
 
@@ -245,25 +249,23 @@ impl Tracker {
                 .map(|(pid, metadata)| (*pid, Some(metadata.start_time))),
         );
 
-        let mut new_processes = HashSet::new();
-        for (pid, metadata) in &current {
-            match self.processes.get(pid) {
-                Some(previous) if previous.start_time == metadata.start_time => {}
-                previous => {
-                    if previous.is_some() {
-                        // The pid was reused, we must not keep using the old spy
-                        self.spies.forget(pid.as_u32() as py_spy::Pid);
-                    }
-                    info!("Tracking new process {pid} ({})", metadata.name);
-                    new_processes.insert(*pid);
-                }
+        let (new_processes, exited_processes) = process_changes(&self.processes, &current);
+        for pid in &new_processes {
+            let name = &current[pid].name;
+            if let Some(previous) = self.processes.get(pid) {
+                info!(
+                    "Tracked process {pid} ({}) exited, its pid now belongs to {name}",
+                    previous.name
+                );
+                self.spies.forget(pid.as_u32() as py_spy::Pid);
+                self.system.forget_process(*pid);
+            } else {
+                info!("Tracking new process {pid} ({name})");
             }
         }
-        let mut exited_processes = HashMap::new();
-        for (pid, metadata) in &self.processes {
+        for pid in exited_processes.keys() {
             if !current.contains_key(pid) {
                 info!("Tracked process {pid} exited");
-                exited_processes.insert(*pid, metadata.clone());
             }
         }
 
@@ -293,5 +295,62 @@ impl Tracker {
             Ok(res) => res,
             Err(panic) => std::panic::resume_unwind(panic),
         }
+    }
+}
+
+/// A replacement is both the exit of the previous process and the start of the new one.
+fn process_changes(
+    previous: &HashMap<sysinfo::Pid, ProcessMetadata>,
+    current: &HashMap<sysinfo::Pid, ProcessMetadata>,
+) -> (
+    HashSet<sysinfo::Pid>,
+    HashMap<sysinfo::Pid, ProcessMetadata>,
+) {
+    let same_process = |pid: &sysinfo::Pid,
+                        metadata: &ProcessMetadata,
+                        other: &HashMap<sysinfo::Pid, ProcessMetadata>| {
+        other
+            .get(pid)
+            .is_some_and(|other| other.start_time == metadata.start_time)
+    };
+    let started = current
+        .iter()
+        .filter(|(pid, metadata)| !same_process(pid, metadata, previous))
+        .map(|(pid, _)| *pid)
+        .collect();
+    let exited = previous
+        .iter()
+        .filter(|(pid, metadata)| !same_process(pid, metadata, current))
+        .map(|(pid, metadata)| (*pid, metadata.clone()))
+        .collect();
+    (started, exited)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pid_replacement_is_an_exit_and_a_start() {
+        let pid = sysinfo::Pid::from_u32(42);
+        let old = ProcessMetadata {
+            name: "old".into(),
+            parent_pid: None,
+            start_time: 1,
+        };
+        let new = ProcessMetadata {
+            name: "new".into(),
+            parent_pid: None,
+            start_time: 2,
+        };
+        let previous = HashMap::from([(pid, old.clone())]);
+        assert_eq!(
+            process_changes(&previous, &previous),
+            (HashSet::new(), HashMap::new())
+        );
+        assert_eq!(
+            process_changes(&previous, &HashMap::from([(pid, new)])),
+            (HashSet::from([pid]), HashMap::from([(pid, old)]))
+        );
     }
 }
