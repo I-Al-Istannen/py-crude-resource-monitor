@@ -195,6 +195,12 @@ impl SystemMeasurements {
         })
     }
 
+    /// Discard cached handles and CPU baselines when a PID belongs to a new process.
+    pub fn forget_process(&mut self, pid: Pid) {
+        self.previous_cpu_times.remove(&pid);
+        self.thread_cpu_times.forget(pid);
+    }
+
     pub fn get_global_info(&mut self) -> ProcessResources {
         let memory = self.system.used_memory() + self.system.used_swap();
         // We do not want to normalize global cpu usage, 100% means all cores are fully loaded.
@@ -281,6 +287,12 @@ struct ThreadCpuTimes {
 }
 
 impl ThreadCpuTimes {
+    fn forget(&mut self, pid: Pid) {
+        self.processes.remove(&pid);
+        self.current.remove(&pid);
+        self.previous.remove(&pid);
+    }
+
     /// Starts a new refresh and forgets about processes that are not alive anymore
     fn next_refresh(&mut self, alive: impl Fn(Pid) -> bool) {
         self.processes.retain(|pid, _| alive(*pid));
@@ -403,6 +415,25 @@ fn parse_pss(rollup: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forgets_all_thread_state_when_a_pid_is_reused() {
+        let pid = Pid::from_u32(42);
+        let mut reader = ThreadCpuTimes::default();
+        reader.processes.insert(pid, None);
+        reader
+            .current
+            .insert(pid, HashMap::from([(1, Duration::from_secs(1))]));
+        reader
+            .previous
+            .insert(pid, HashMap::from([(1, Duration::from_secs(1))]));
+
+        reader.forget(pid);
+
+        assert!(!reader.processes.contains_key(&pid));
+        assert!(!reader.current.contains_key(&pid));
+        assert!(!reader.previous.contains_key(&pid));
+    }
 
     #[test]
     fn parses_the_cpu_ticks_of_all_cores() {
