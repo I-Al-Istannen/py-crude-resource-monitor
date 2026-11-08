@@ -1,4 +1,4 @@
-use crate::tachyon::TachyonHelper;
+use crate::tachyon::{TachyonError, TachyonHelper};
 use crate::types::{NativeCapture, StackTrace};
 use log::{debug, info, warn};
 use py_spy::config::LockingStrategy;
@@ -6,6 +6,7 @@ use py_spy::{Config, PythonSpy};
 use snafu::{Location, ResultExt, Snafu};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, atomic::AtomicBool};
 
 /// How often we try to attach to a process before giving up on it. Freshly spawned Python
 /// processes might not have initialized their interpreter yet, so the first attempts can fail.
@@ -42,6 +43,21 @@ pub enum StackSampler {
 }
 
 impl StackSampler {
+    pub fn new(
+        backend: &StackBackend,
+        quit_requested: Arc<AtomicBool>,
+    ) -> Result<Self, TachyonError> {
+        Ok(match backend {
+            StackBackend::PySpy {
+                native_capture,
+                nonblocking,
+            } => Self::PySpy(SpyHelper::new(*native_capture, *nonblocking)),
+            StackBackend::Tachyon { python, pause } => {
+                Self::Tachyon(TachyonHelper::new(python, *pause, quit_requested)?)
+            }
+        })
+    }
+
     /// Attaches to processes in `pids` we are not attached to yet and forgets all others.
     pub fn sync(&mut self, pids: &HashSet<py_spy::Pid>) {
         match self {

@@ -3,8 +3,8 @@ mod writer;
 use self::writer::{WriteRequest, write_samples};
 use crate::memory_sampler::MemorySampler;
 use crate::resources::SystemMeasurements;
-use crate::stacktraces::{SpyHelper, StackBackend, StackSampler};
-use crate::tachyon::{TachyonError, TachyonHelper};
+use crate::stacktraces::{StackBackend, StackSampler};
+use crate::tachyon::TachyonError;
 use crate::types::{MemorySample, ProcessMetadata, ProcessResources};
 use log::info;
 use snafu::{Location, ResultExt, Snafu};
@@ -96,15 +96,7 @@ impl Tracker {
             .transpose()
             .context(SystemMeasurementsSnafu)?;
 
-        let spies = match backend {
-            StackBackend::PySpy {
-                native_capture,
-                nonblocking,
-            } => StackSampler::PySpy(SpyHelper::new(*native_capture, *nonblocking)),
-            StackBackend::Tachyon { python, pause } => StackSampler::Tachyon(
-                TachyonHelper::new(python, *pause, quit_requested).context(TachyonSnafu)?,
-            ),
-        };
+        let spies = StackSampler::new(backend, quit_requested).context(TachyonSnafu)?;
 
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(100);
 
