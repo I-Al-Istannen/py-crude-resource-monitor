@@ -367,7 +367,9 @@ struct ProfileBuilderProcess<'a> {
     thread_lane_ends: HashMap<String, Vec<u128>>,
     thread_end_times: HashMap<ThreadHandle, Timestamp>,
     memory_counter: ProfileCounter<Initialized>,
-    io_counter: Option<ProfileCounter<Initialized>>,
+    /// Unlike the memory, the I/O is recorded as the bytes since the previous sample, so its
+    /// samples are the values themselves
+    io_counter: Option<CounterHandle>,
     /// The number of threads waiting for the GIL, see [`Self::add_gil_wait_counter`]
     gil_wait_counter: Option<CounterHandle>,
 }
@@ -422,7 +424,8 @@ impl<'a> ProfileBuilderProcess<'a> {
                     "I/O read/write in bytes",
                     GraphColor::Teal,
                 )
-                .initialize(&mut parent.profile, start_timestamp, 0.),
+                .initialize(&mut parent.profile, start_timestamp, 0.)
+                .handle,
             )
         } else {
             None
@@ -668,11 +671,12 @@ impl<'a> ProfileBuilderProcess<'a> {
         };
         self.memory_counter
             .add_value(&mut self.parent.profile, timestamp, memory as f64);
-        if let Some(io_counter) = self.io_counter.as_mut() {
-            io_counter.add_value(
-                &mut self.parent.profile,
+        if let Some(io_counter) = self.io_counter {
+            self.parent.profile.add_counter_sample(
+                io_counter,
                 timestamp,
                 (resources.disk_read_bytes + resources.disk_write_bytes) as f64,
+                1,
             );
         }
     }
@@ -1625,6 +1629,33 @@ mod tests {
         assert_eq!(
             thread_cpu_deltas(processes, "worker"),
             serde_json::json!([100000, 100000, 100000, 300000])
+        );
+    }
+
+    #[test]
+    fn bandwidth_is_the_bytes_since_the_previous_sample() {
+        // Constant I/O must not look like none at all
+        let samples = (0..3)
+            .map(|i| {
+                let mut line = line(1000 + i * 100, vec![stacktrace(1, MAIN_THREAD_NAME)], &[]);
+                line.resources.disk_read_bytes = 100;
+                line.resources.disk_write_bytes = 50;
+                line
+            })
+            .collect();
+        let processes = HashMap::from([(ReportIdentifier::Pid(1), samples)]);
+
+        let profile = generate_fxprof(processes, &args()).unwrap();
+        let json = serde_json::to_value(&profile).unwrap();
+        let counter = json["counters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|it| it["name"] == "io")
+            .unwrap();
+        assert_eq!(
+            counter["samples"]["count"],
+            serde_json::json!([0.0, 150.0, 150.0, 150.0])
         );
     }
 
