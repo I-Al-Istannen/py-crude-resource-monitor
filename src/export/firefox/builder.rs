@@ -11,7 +11,7 @@ use fxprof_processed_profile::{
 use log::info;
 use snafu::{OptionExt, Whatever};
 use std::borrow::Borrow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 pub(super) const MAIN_THREAD_NAME: &str = "MainThread";
 pub(super) const CATEGORY_PYTHON_NAME: &str = "Python";
@@ -151,9 +151,9 @@ impl ProfileBuilder {
             .collect()
     }
 
-    pub(super) fn add_global(&mut self, samples: Vec<JsonLine>) -> Result<(), Whatever> {
+    pub(super) fn add_global(&mut self, samples: Vec<JsonLine>) {
         let Some(first_sample) = samples.first() else {
-            return Ok(());
+            return;
         };
         let (start, end) = (first_sample.time, samples.last().unwrap().time);
 
@@ -163,8 +163,6 @@ impl ProfileBuilder {
         // Global CPU is meant to be divided by the number of cores, 100% means all cores are busy
         process.add_label_samples("Global", samples, |line| line.resources.cpu);
         process.finish(end);
-
-        Ok(())
     }
 
     /// Adds a track with the sum of the PSS of all processes over time. Unlike the sum of their
@@ -194,13 +192,9 @@ impl ProfileBuilder {
 
     /// Adds processes that ran one after another as a single process to the profile. With
     /// `pack_threads`, threads are packed into lanes too, see [`ProfileBuilderProcess`].
-    pub(super) fn add_lane(
-        &mut self,
-        lane: Vec<Instance>,
-        pack_threads: bool,
-    ) -> Result<(), Whatever> {
+    pub(super) fn add_lane(&mut self, lane: Vec<Instance>, pack_threads: bool) {
         let (Some(first), Some(last)) = (lane.first(), lane.last()) else {
-            return Ok(());
+            return;
         };
         let (pid, start, end) = (first.pid, first.start(), last.end());
         let name = match lane.len() {
@@ -221,11 +215,9 @@ impl ProfileBuilder {
             process.add_lifetime_marker(&instance);
             process.add_stack_error_markers(&instance.samples);
             previous_end = Some(instance.end());
-            process.add_instance(instance)?;
+            process.add_instance(instance);
         }
         process.finish(end);
-
-        Ok(())
     }
 
     /// Without this, the Firefox Profiler shows the 15 busiest threads. Pools with many busy
@@ -372,9 +364,8 @@ impl<'a> ProfileBuilderProcess<'a> {
         self.parent.cpu(percent, window_millis)
     }
 
-    fn add_instance(&mut self, instance: Instance) -> Result<(), Whatever> {
-        if instance.has_stacktraces() {
-            let main_thread_id = main_thread_id(&instance.samples)?;
+    fn add_instance(&mut self, instance: Instance) {
+        if let Some(main_thread_id) = main_thread_id(&instance.samples) {
             self.add_stack_samples(instance.samples, main_thread_id);
         } else {
             info!(
@@ -389,7 +380,6 @@ impl<'a> ProfileBuilderProcess<'a> {
                 line.resources.cpu * line.resources.cpus.unwrap_or(1) as f32
             });
         }
-        Ok(())
     }
 
     /// Adds samples without stacks, attributing them to a single frame named `label`.
@@ -409,7 +399,7 @@ impl<'a> ProfileBuilderProcess<'a> {
             }]
             .into_iter(),
         );
-        self.add_memory_timeline(&samples);
+        self.add_resource_samples(&samples);
         let windows = self.parent.cpu_windows(&samples);
         for (line, window) in samples.into_iter().zip(windows) {
             if line.exited {
@@ -420,10 +410,6 @@ impl<'a> ProfileBuilderProcess<'a> {
             self.parent
                 .profile
                 .add_sample(self.main_thread, timestamp, stack, cpu_delta, 1);
-            self.add_bandwidth_value(
-                timestamp,
-                line.resources.disk_read_bytes + line.resources.disk_write_bytes,
-            );
         }
     }
 
@@ -465,7 +451,7 @@ impl<'a> ProfileBuilderProcess<'a> {
 
     fn add_stack_samples(&mut self, samples: Vec<JsonLine>, main_thread_id: u64) {
         let thread_keys = self.thread_keys(&samples, main_thread_id);
-        self.add_memory_timeline(&samples);
+        self.add_resource_samples(&samples);
         let windows = self.parent.cpu_windows(&samples);
         for (line, window) in samples.into_iter().zip(windows) {
             if line.exited {
@@ -571,9 +557,15 @@ impl<'a> ProfileBuilderProcess<'a> {
                     .profile
                     .add_sample(thread, timestamp, stack, cpu_delta, 1);
             }
+        }
+    }
 
+    /// Process resources are independent of whether stack capture succeeded.
+    fn add_resource_samples(&mut self, samples: &[JsonLine]) {
+        self.add_memory_timeline(samples);
+        for line in samples.iter().filter(|line| !line.exited) {
             self.add_bandwidth_value(
-                timestamp,
+                self.time(line.time),
                 line.resources.disk_read_bytes + line.resources.disk_write_bytes,
             );
         }
@@ -710,60 +702,22 @@ fn error_reason(error: &str) -> &str {
 }
 
 /// Picks the thread of the samples that is shown as the process's main thread
-fn main_thread_id(samples: &[JsonLine]) -> Result<u64, Whatever> {
-    let mut threads = samples
+fn main_thread_id(samples: &[JsonLine]) -> Option<u64> {
+    samples
         .iter()
-        .flat_map(|it| it.stacktraces.iter())
-        .map(|it| (it.thread_id, it.thread_name.as_deref().unwrap_or("unnamed")))
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    // Ensure the report is deterministic
-    threads.sort_by_key(|(a_id, _)| *a_id);
-
-    let main_thread = threads.iter().find(|(_, name)| *name == MAIN_THREAD_NAME);
-
-    let main_thread_id = match main_thread {
-        Some((thread_id, _)) => *thread_id,
-        None => {
-            let all_threads = threads.iter().map(|(_, name)| *name).collect::<Vec<_>>();
-            info!(
-                "No main thread found in samples, found threads `{}`.",
-                all_threads.as_slice().join(", ")
-            );
-            let mut threads_with_py_frame = samples
-                .iter()
-                .flat_map(|it| it.stacktraces.iter())
-                .filter(|it| it.frames.iter().any(|f| !f.is_entry))
-                .map(|it| (it.thread_id, it.thread_name.as_deref().unwrap_or("unnamed")))
-                .collect::<Vec<_>>();
-            threads_with_py_frame.dedup();
-
-            let chosen = if !threads_with_py_frame.is_empty() {
-                info!(
-                    "Choosing from threads with Python frames: `{}`.",
-                    threads_with_py_frame
-                        .iter()
-                        .map(|(_, name)| *name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                threads_with_py_frame
-                    .first()
-                    .whatever_context("no threads found")?
+        .flat_map(|line| &line.stacktraces)
+        .min_by_key(|trace| {
+            // Prefer a named main thread, then the first observed Python thread,
+            // then the lowest thread ID. No stacks means a resource-only track.
+            if trace.thread_name.as_deref() == Some(MAIN_THREAD_NAME) {
+                (0, trace.thread_id)
+            } else if trace.frames.iter().any(|frame| !frame.is_entry) {
+                (1, 0)
             } else {
-                threads.first().whatever_context("no threads found")?
-            };
-
-            info!(
-                "Using first thread `{}` with id `{}` as main thread.",
-                chosen.1, chosen.0
-            );
-            chosen.0
-        }
-    };
-
-    Ok(main_thread_id)
+                (2, trace.thread_id)
+            }
+        })
+        .map(|trace| trace.thread_id)
 }
 
 /// Adapts absolute measurements to the deltas Firefox counters store.

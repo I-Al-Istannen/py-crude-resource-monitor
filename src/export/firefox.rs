@@ -148,7 +148,7 @@ fn generate_fxprof(
     for (identifier, samples) in processes {
         match identifier {
             ReportIdentifier::Pid(pid) => instances.extend(Instance::split(pid, samples)),
-            ReportIdentifier::Global => builder.add_global(samples)?,
+            ReportIdentifier::Global => builder.add_global(samples),
         }
     }
     if args.memory == MemoryMetric::Pss {
@@ -176,7 +176,7 @@ fn generate_fxprof(
         instances.into_iter().map(|it| vec![it]).collect()
     };
     for lane in lanes {
-        builder.add_lane(lane, pack)?;
+        builder.add_lane(lane, pack);
     }
 
     Ok(builder.finish())
