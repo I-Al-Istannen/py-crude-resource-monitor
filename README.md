@@ -138,6 +138,10 @@ Options:
   -h, --help                     Print help (see more with '--help')
 ```
 
+Tachyon helper startup and each capture have a 30-second deadline. After a stalled capture,
+the monitor keeps recording resources and restarts the helper for the next capture. Ctrl+C
+and SIGTERM cancel a pending helper request so the monitor can finish writing the sample files.
+
 ```text
 Host a web server to view the profile data
 
