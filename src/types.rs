@@ -30,6 +30,16 @@ pub struct JsonLine<S = StackTrace> {
     pub time: u128,
 }
 
+impl<S> JsonLine<S> {
+    /// The earliest measurement in this line, including its memory samples.
+    pub fn earliest_time(&self) -> u128 {
+        self.memory_samples
+            .iter()
+            .map(|sample| sample.time)
+            .fold(self.time, u128::min)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemorySample {
     /// Milliseconds since the unix epoch

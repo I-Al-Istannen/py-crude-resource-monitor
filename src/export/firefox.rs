@@ -1,6 +1,7 @@
 mod builder;
 mod lanes;
 mod markers;
+mod normalize;
 #[cfg(test)]
 mod tests;
 

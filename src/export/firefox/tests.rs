@@ -797,3 +797,56 @@ fn adds_no_gil_wait_track_without_waiting_threads() {
 
     assert_eq!(gil_wait_counts(&json, 1), None);
 }
+
+#[test]
+fn orders_retained_memory_before_computing_deltas() {
+    // A flat point retained across a tick is emitted only when memory changes afterwards.
+    for with_stacks in [false, true] {
+        let mut samples = Vec::new();
+        for (time, memory, retained) in [
+            (1000, 100, vec![]),
+            (2000, 150, vec![(1010, 100)]),
+            (3000, 150, vec![(1990, 100), (2010, 150)]),
+        ] {
+            let threads = if with_stacks {
+                vec![stacktrace(1, MAIN_THREAD_NAME)]
+            } else {
+                vec![]
+            };
+            let mut sample = line(time, threads, &[]);
+            sample.resources.memory = memory;
+            sample.memory_samples = retained
+                .into_iter()
+                .map(|(time, memory)| MemorySample { time, memory })
+                .collect();
+            samples.push(sample);
+        }
+        let json = processes_json(HashMap::from([(ReportIdentifier::Pid(7), samples)]));
+        assert_eq!(
+            memory_graph(&json, 7),
+            [
+                (0.0, 0.0),
+                (0.0, 100.0),
+                (10.0, 100.0),
+                (990.0, 100.0),
+                (1000.0, 150.0),
+                (1010.0, 150.0),
+                (2000.0, 150.0),
+            ]
+        );
+    }
+}
+
+#[test]
+fn memory_can_precede_the_first_regular_sample() {
+    let mut sample = line(1000, vec![], &[]);
+    sample.memory_samples = vec![MemorySample {
+        time: 990,
+        memory: 512,
+    }];
+    let json = processes_json(HashMap::from([(ReportIdentifier::Pid(7), vec![sample])]));
+    assert_eq!(
+        memory_graph(&json, 7),
+        [(0.0, 0.0), (0.0, 512.0), (10.0, 1024.0)]
+    );
+}
