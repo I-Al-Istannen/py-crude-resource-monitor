@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn reads_samples_with_inline_frames() {
         // Written by versions before frames and stacks were stored separately
-        let line = r#"{"stacktraces":[{"pid":42,"thread_id":1,"thread_name":null,"os_thread_id":null,"active":true,"owns_gil":false,"frames":[{"name":"work","filename":"/w/main.py","module":null,"short_filename":null,"line":5,"locals":null,"is_entry":false}],"process_info":null}],"resources":{"memory":1,"cpu":2.0,"disk_read_bytes":0,"disk_write_bytes":0,"thread_resources":{}},"index":0,"time":1000}"#;
+        let line = r#"{"stacktraces":[{"pid":42,"thread_id":1,"thread_name":null,"os_thread_id":null,"active":true,"owns_gil":false,"frames":[{"name":"work","filename":"/w/main.py","module":null,"short_filename":null,"line":5,"locals":null,"is_entry":false}],"process_info":null}],"resources":{"memory":1,"cpu_core_percent":2.0,"disk_read_bytes":0,"disk_write_bytes":0,"thread_resources":{}},"index":0,"time":1000}"#;
 
         let read = read_samples(line).unwrap();
 

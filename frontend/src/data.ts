@@ -2,7 +2,8 @@ import { z } from "zod";
 
 export const ProcessResourceSchema = z.object({
   memory: z.number(),
-  cpu: z.number(),
+  cpu_core_percent: z.number(),
+  cpus: z.number().optional(),
 });
 export type ProcessResource = z.infer<typeof ProcessResourceSchema>;
 
@@ -155,7 +156,8 @@ export function processReportToSeries(
       continue;
     }
     memoryValues[index] = entry.resources.memory;
-    cpuValues[index] = entry.resources.cpu;
+    // Display machine-wide percentages; recordings and parsed data use one-core units.
+    cpuValues[index] = entry.resources.cpu_core_percent / (entry.resources.cpus ?? 1);
   }
 
   return {

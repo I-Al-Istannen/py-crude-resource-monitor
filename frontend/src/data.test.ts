@@ -9,7 +9,7 @@ import {
 function entry(time: number, cpu: number): ProcessReportEntry {
   return {
     stacktraces: [],
-    resources: { memory: cpu * 10, cpu },
+    resources: { memory: cpu * 10, cpu_core_percent: cpu },
     index: 0,
     time,
   };
@@ -87,14 +87,14 @@ describe("parseJsonProcessReport", () => {
           process_info: null,
         },
       ],
-      resources: { memory: 1, cpu: 2 },
+      resources: { memory: 1, cpu_core_percent: 2 },
       index: 0,
       time: 1000,
     };
     const failed = {
       stacktraces: [],
       stacktrace_error: "process went away",
-      resources: { memory: 1, cpu: 2 },
+      resources: { memory: 1, cpu_core_percent: 2 },
       index: 1,
       time: 2000,
     };
@@ -130,7 +130,7 @@ describe("parseJsonProcessReport", () => {
     });
     const sample = (index: number, stacks: (number | null)[]) => ({
       stacktraces: stacks.map(thread),
-      resources: { memory: 1, cpu: 2 },
+      resources: { memory: 1, cpu_core_percent: 2 },
       index,
       time: 1000 * index,
     });
@@ -162,7 +162,7 @@ describe("parseJsonProcessReport", () => {
   test("skips an incomplete last line", () => {
     const sample = JSON.stringify({
       stacktraces: [],
-      resources: { memory: 1, cpu: 2 },
+      resources: { memory: 1, cpu_core_percent: 2 },
       index: 0,
       time: 1000,
     });
@@ -170,5 +170,17 @@ describe("parseJsonProcessReport", () => {
     const parsed = parseJsonProcessReport("1.json", `${sample}\n${sample.slice(0, 20)}`);
 
     expect(parsed.entries).toHaveLength(1);
+  });
+});
+
+
+describe("CPU recording units", () => {
+  test("normalizes core units only for display", () => {
+    const parsed = parseJsonProcessReport("1.json", JSON.stringify({
+      ...entry(1000, 200),
+      resources: { memory: 1024, cpu_core_percent: 200, cpus: 4 },
+    }) + "\n");
+    expect(parsed.entries[0].resources.cpu_core_percent).toBe(200);
+    expect(completeReportToSeries([parsed]).yData[0]).toEqual([50]);
   });
 });

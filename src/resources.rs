@@ -163,9 +163,7 @@ impl SystemMeasurements {
             .since_previous_refresh(pid, started_since_last_refresh);
         let process = self.system.process(pid)?;
         let process_cpu = self.cpu_usage(process, started_since_last_refresh);
-        // Normalize cpu usage to number of cores, as firefox profiler can only render up to 100%
         let cpus = self.system.cpus().len().max(1) as u32;
-        let cpu_usage = process_cpu / cpus as f32;
         let memory = process.memory();
         let disk_usage = process.disk_usage();
 
@@ -175,9 +173,6 @@ impl SystemMeasurements {
             .map(|(tid, used)| {
                 let resources = ThreadResources {
                     cpu: self.cpu_percent(used),
-                    memory,
-                    disk_read_bytes: 0,
-                    disk_write_bytes: 0,
                 };
                 (tid, resources)
             })
@@ -186,7 +181,7 @@ impl SystemMeasurements {
         Some(ProcessResources {
             memory,
             pss: self.record_pss.then(|| read_pss(pid)).flatten(),
-            cpu: cpu_usage,
+            cpu: process_cpu,
             cpus: Some(cpus),
             disk_read_bytes: disk_usage.read_bytes,
             disk_write_bytes: disk_usage.written_bytes,
@@ -203,8 +198,8 @@ impl SystemMeasurements {
 
     pub fn get_global_info(&mut self) -> ProcessResources {
         let memory = self.system.used_memory() + self.system.used_swap();
-        // We do not want to normalize global cpu usage, 100% means all cores are fully loaded.
-        // sysinfo updates it at most every 200ms, so we measure it ourselves where we can.
+        // sysinfo updates global CPU at most every 200ms, so measure it ourselves where possible.
+        // Convert its machine-wide percentage to the same one-core units as process/thread CPU.
         let cpu = match (self.previous_cpu_ticks, self.cpu_ticks) {
             (Some(previous), Some(current)) if current.total > previous.total => {
                 let busy = current.busy.saturating_sub(previous.busy);
@@ -220,11 +215,12 @@ impl SystemMeasurements {
                 (read + usage.read_bytes, written + usage.written_bytes)
             });
 
+        let cpus = self.system.cpus().len().max(1) as u32;
         ProcessResources {
             memory,
             pss: None,
-            cpu,
-            cpus: None,
+            cpu: cpu * cpus as f32,
+            cpus: Some(cpus),
             disk_read_bytes,
             disk_write_bytes,
             total_read_call_bytes: None,
