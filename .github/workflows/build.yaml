@@ -78,11 +78,31 @@ jobs:
           - name: Stress Tests
             id: stress-tests
             args: ""
-            summary: stress-tests/results/summary.md
-          - name: Real Projects
-            id: real-projects
-            args: "--realworld"
-            summary: stress-tests/results/realworld/summary.md
+            results: ""
+          - name: Real Project (black_django)
+            id: real-black-django
+            args: "--realworld black_django"
+            results: "realworld/"
+          - name: Real Project (pip_install)
+            id: real-pip-install
+            args: "--realworld pip_install"
+            results: "realworld/"
+          - name: Real Project (pytest_pandas)
+            id: real-pytest-pandas
+            args: "--realworld pytest_pandas"
+            results: "realworld/"
+          - name: Real Project (pytest_polars)
+            id: real-pytest-polars
+            args: "--realworld pytest_polars"
+            results: "realworld/"
+          - name: Real Project (pytest_sklearn)
+            id: real-pytest-sklearn
+            args: "--realworld pytest_sklearn"
+            results: "realworld/"
+          - name: Real Project (pytest_sympy)
+            id: real-pytest-sympy
+            args: "--realworld pytest_sympy"
+            results: "realworld/"
     steps:
       - uses: actions/checkout@v7
 
@@ -101,7 +121,7 @@ jobs:
 
       - name: Add summary
         if: always()
-        run: cat ${{ matrix.summary }} >> "$GITHUB_STEP_SUMMARY" || true
+        run: cat stress-tests/results/${{ matrix.results }}summary.md >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Upload results
         if: failure()
