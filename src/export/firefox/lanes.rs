@@ -51,10 +51,6 @@ impl Instance {
             .map_or("Process", |it| it.name.as_str())
     }
 
-    pub(super) fn has_stacktraces(&self) -> bool {
-        self.samples.iter().any(|it| !it.stacktraces.is_empty())
-    }
-
     /// Only Tachyon knows whether threads wait for the GIL
     pub(super) fn waits_for_gil(&self) -> bool {
         self.samples
