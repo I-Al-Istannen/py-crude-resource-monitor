@@ -10,7 +10,7 @@ mod view;
 
 use crate::export::FirefoxExportArguments;
 use crate::stacktraces::StackBackend;
-use crate::tracker::{Tracker, TrackerError};
+use crate::tracker::{RecordingOptions, Tracker, TrackerError};
 use crate::types::NativeCapture;
 use crate::view::ViewError;
 use clap::builder::Styles;
@@ -369,9 +369,11 @@ fn run_profile(
         pid,
         output_dir.clone(),
         &backend,
-        record_pss,
-        memory_interval,
-        !uncompressed,
+        RecordingOptions {
+            record_pss,
+            memory_interval,
+            compress: !uncompressed,
+        },
     )
     .context(TrackerSnafu)?;
     info!("Tracking started");
