@@ -1,0 +1,17 @@
+# Real projects for `./run.sh --realworld`, on top of the stress-test image. Everything is pinned,
+# and the pip scenario installs from wheels downloaded here, so a run does not need the network.
+# Built by run.sh, which passes the image to build on as BASE.
+ARG BASE=py-crude-resource-monitor-stress
+FROM ${BASE}
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+# pytest 9 is too new for the test suites of some of the projects
+RUN pip install --no-cache-dir --root-user-action=ignore \
+      pytest==8.4.2 pytest-xdist==3.8.0 pytest-timeout==2.4.0 hypothesis==6.170.15 \
+      numpy==2.5.4 pandas==3.1.1 pyarrow==26.0.1 scikit-learn==1.9.1 pydantic==2.14.3 \
+      fsspec==2026.9.0 black==26.10.1 sympy==1.14.0
+# Sources of projects that are not installed packages, at the version that is installed or tested
+RUN git clone -q --depth 1 --filter=blob:none --sparse --branch py-2.1.0 \
+      https://github.com/pola-rs/polars.git /work/polars && \
+    git -C /work/polars sparse-checkout set py-polars && \
+    git clone -q --depth 1 --branch 5.2 https://github.com/django/django.git /work/django
+RUN pip download --no-cache-dir -q -d /work/wheels django==5.2 requests==2.32.5 sqlalchemy==2.0.43 pydantic==2.14.3

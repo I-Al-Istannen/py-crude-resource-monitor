@@ -12,6 +12,9 @@ profiles it, then evaluates every check the scenario asked for against the recor
 With `--findings`, it runs the scenarios in `findings/` instead: reproducers for the patterns the
 viewer should detect, with the phases where each one occurs.
 
+With `--realworld`, it profiles real projects (see `realworld/`) and compares the samples of their
+whole process tree with what the kernel counted for it.
+
 Only meaningful on Linux, as the ground truth is read from /proc.
 """
 
@@ -31,6 +34,7 @@ import zstandard
 HERE = Path(__file__).resolve().parent
 SCENARIOS = HERE / "scenarios"
 FINDINGS = HERE / "findings"
+REALWORLD = HERE / "realworld"
 MiB = 1024 * 1024
 
 PASS, FAIL, LIMITATION, INFO, EXPECTED = "pass", "FAIL", "limitation", "info", "expected"
@@ -40,6 +44,7 @@ PROFILER_ARGS = {
     "native_stacks": ["--native"],
     "polars_query": ["--native", "all"],
     "fork_shared": ["--pss"],
+    "pytest_polars": ["--native", "all"],
 }
 # The pid of the Firefox track with the total PSS, which is not a real process
 PSS_TOTAL_PID = 2**32 - 1
@@ -186,8 +191,11 @@ class Profile:
 
 
 def has_frame(sample: dict, function: str) -> bool:
+    # Threads without a stack, e.g. native ones that never ran Python code, have no frames
     return any(
-        frame["name"] == function for trace in sample["stacktraces"] for frame in trace["frames"]
+        frame["name"] == function
+        for trace in sample["stacktraces"]
+        for frame in trace.get("frames", [])
     )
 
 
@@ -516,15 +524,41 @@ def check_firefox_lanes(profile, truth, phase, check):
 
 
 def check_firefox_cpu_total(profile, truth, phase, check):
-    """The Firefox export contains the CPU time of all processes, even if they share tracks."""
+    """The Firefox export contains the CPU time of all processes, even if they share tracks.
+
+    It only has tracks for threads that were in a stack at some point, so CPU time of threads
+    py-spy never saw is missing. That is the case for native threads that never run Python code
+    (BLAS, OpenMP) unless `--native all` is given, and for threads that exit between two samples.
+    This is a limitation as long as all CPU time of the threads with a stack is there."""
     raw = sum(profile.cpu_seconds(samples) for samples in profile.processes.values())
     exported = sum(
         sum(t["samples"].get("threadCPUDelta") or []) / 1e6
         for t in profile.firefox_threads()
         if t["pid"] not in ("0", str(PSS_TOTAL_PID))
     )
-    status = PASS if within(exported, raw, 0.5, 0.05) else FAIL
-    return status, f"{raw:.2f} CPU-s in the profile", f"{exported:.2f} CPU-s exported"
+    expected = f"{raw:.2f} CPU-s in the profile"
+    measured = f"{exported:.2f} CPU-s exported"
+    if within(exported, raw, 0.5, 0.05):
+        return PASS, expected, measured
+
+    visible = 0.0
+    for samples in profile.processes.values():
+        with_stack = {
+            str(trace["os_thread_id"])
+            for sample in samples
+            for trace in sample["stacktraces"]
+            if trace.get("os_thread_id")
+        }
+        for previous, current in zip(samples, samples[1:]):
+            seconds = (current["time"] - previous["time"]) / 1000
+            visible += seconds * sum(
+                thread["cpu"] / 100
+                for thread_id, thread in current["resources"]["thread_resources"].items()
+                if thread_id in with_stack
+            )
+    measured += f" ({visible:.2f} CPU-s ran in threads with a stack)"
+    status = LIMITATION if within(exported, visible, 0.5, 0.05) else FAIL
+    return status, expected, measured
 
 
 def check_cpu_integral(profile, truth, phase, check):
@@ -532,6 +566,84 @@ def check_cpu_integral(profile, truth, phase, check):
     expected = truth["total_cpu_seconds"]
     status = PASS if within(measured, expected, 0.25, 0.1) else FAIL
     return status, f"{expected:.2f} CPU-s", f"{measured:.2f} CPU-s"
+
+
+def tree_samples(profile, phase) -> dict[int, list[dict]]:
+    """The samples of all processes of the profiled tree during the phase"""
+    end = phase["end"] + profile.interval
+    return {
+        pid: [s for s in samples if phase["start"] <= s["time"] <= end]
+        for pid, samples in profile.processes.items()
+    }
+
+
+def check_exit_code(profile, truth, phase, check):
+    expected, measured = phase["ok_exit_codes"], phase["exit_code"]
+    status = PASS if measured in expected else FAIL
+    return status, "exit code " + " or ".join(map(str, expected)), f"exit code {measured}"
+
+
+def check_tree_cpu(profile, truth, phase, check):
+    """The CPU time of all processes of the tree adds up to what the kernel counted for them. Each
+    process loses up to one sampling interval at its end, so the allowed difference grows with the
+    number of processes."""
+    tree = {pid: samples for pid, samples in tree_samples(profile, phase).items() if samples}
+    measured = sum(profile.cpu_seconds(samples) for samples in tree.values())
+    expected = phase["children_cpu_seconds"] + phase["cpu_seconds"]
+    absolute = max(1.0, 0.25 * profile.interval / 1000 * len(tree))
+    status = PASS if within(measured, expected, absolute, 0.15) else FAIL
+    return (
+        status,
+        f"{expected:.1f} CPU-s counted by the kernel",
+        f"{measured:.1f} CPU-s in {len(tree)} processes",
+    )
+
+
+def check_tree_peak_memory(profile, truth, phase, check):
+    """The highest RSS of any process of the tree, including the one between the samples, is close
+    to the high-water mark of the biggest process that the kernel kept."""
+    measured = 0
+    for samples in tree_samples(profile, phase).values():
+        for sample in samples:
+            measured = max(measured, sample["resources"]["memory"])
+            for memory_sample in sample.get("memory_samples", []):
+                measured = max(measured, memory_sample["memory"])
+    expected = phase["children_peak_rss"]
+    # Short peaks can fall between two memory measurements, so we only expect to be close
+    status = PASS if 0.85 * expected <= measured <= 1.1 * expected + 10 * MiB else FAIL
+    return status, f"biggest process peaked at {mib(expected)}", f"highest RSS {mib(measured)}"
+
+
+def check_processes(profile, truth, phase, check):
+    """The profile contains the Python processes the project started"""
+    seen = [
+        pid
+        for pid, samples in tree_samples(profile, phase).items()
+        if any(s["stacktraces"] for s in samples)
+    ]
+    status = PASS if len(seen) >= check["min"] else FAIL
+    return status, f">= {check['min']} Python processes", f"{len(seen)} processes with stacks"
+
+
+def check_tree_stack(profile, truth, phase, check):
+    """Busy processes other than the one running the project are mostly inside `function`."""
+    function, minimum = check["function"], check["min_fraction"]
+    busy = [
+        s
+        for pid, samples in tree_samples(profile, phase).items()
+        if pid != truth["pid"]
+        for s in samples
+        if s["resources"]["cpu_core_percent"] >= 50 and s["stacktraces"]
+    ]
+    if not busy:
+        return FAIL, f"busy samples in {function}", "no busy samples"
+    hits = sum(has_frame(s, function) for s in busy)
+    status = PASS if hits / len(busy) >= minimum else FAIL
+    return (
+        status,
+        f">= {minimum:.0%} of busy samples in {function}",
+        f"{hits / len(busy):.0%} ({hits}/{len(busy)})",
+    )
 
 
 CHECKS = {
@@ -555,6 +667,11 @@ CHECKS = {
     "firefox_lanes": check_firefox_lanes,
     "firefox_cpu_total": check_firefox_cpu_total,
     "cpu_integral": check_cpu_integral,
+    "exit_code": check_exit_code,
+    "tree_cpu": check_tree_cpu,
+    "tree_peak_memory": check_tree_peak_memory,
+    "processes": check_processes,
+    "tree_stack": check_tree_stack,
 }
 
 
@@ -641,15 +758,24 @@ def format_table(results: list[Result]) -> str:
 
 
 def main():
-    findings = "--findings" in sys.argv
-    directory = FINDINGS if findings else SCENARIOS
+    findings, realworld = "--findings" in sys.argv, "--realworld" in sys.argv
+    directory = FINDINGS if findings else REALWORLD if realworld else SCENARIOS
     available = sorted(p.stem for p in directory.glob("*.py") if not p.name.startswith("_"))
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("scenarios", nargs="*", help=f"default: all of {', '.join(available)}")
     parser.add_argument("--findings", action="store_true", help="run the scenarios in findings/")
+    parser.add_argument(
+        "--realworld", action="store_true", help="run the real projects in realworld/"
+    )
     parser.add_argument("--binary", default="py-crude-resource-monitor")
-    parser.add_argument("--interval", type=int, default=250, help="sampling interval in ms")
-    output = HERE / "results" / "findings" if findings else HERE / "results"
+    # Some projects only run for a few seconds, so sample more often
+    default_interval = 100 if realworld else 250
+    parser.add_argument(
+        "--interval", type=int, default=default_interval, help="sampling interval in ms"
+    )
+    output = HERE / "results"
+    if findings or realworld:
+        output /= "findings" if findings else "realworld"
     parser.add_argument("--output", type=Path, default=output)
     args = parser.parse_args()
     if unknown := set(args.scenarios) - set(available):
