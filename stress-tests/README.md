@@ -140,6 +140,46 @@ DOCKER_RUN_ARGS="--memory 1g" ./stress-tests/run.sh --findings near_memory_limit
 | `sparse_stacks`           | CPU bursts shorter than a sampling interval.                                               |
 | `slow_patterns`           | `re` cache misses, `deepcopy`, eager `__repr__` in logging, `inspect.stack`, `json`, polars `map_elements`. |
 
+## Real projects
+
+`realworld/` profiles real projects instead of scripts written for the suite, to check that the
+profiler copes with what actually runs in the wild: test suites on `pytest-xdist` workers,
+a tool with a process pool, a run that mostly spawns programs. There is no ground truth measured
+from inside, so each scenario runs the project as a subprocess and lets the kernel count what its
+whole process tree did (`RUSAGE_CHILDREN`). Everything is pinned and the projects are downloaded
+when the image is built, so a run does not need the network.
+
+```bash
+./stress-tests/run.sh --realworld                 # all of them, results in results/realworld/
+./stress-tests/run.sh --realworld pytest_sympy    # a selection
+```
+
+They need a few GiB for the packages and take a few minutes, so they are not part of the default
+run and CI. `run.sh --realworld` builds `Dockerfile.realworld` on top of the stress-test image.
+
+| Scenario         | Project                                                                |
+|------------------|------------------------------------------------------------------------|
+| `black_django`   | black checks Django's source tree with a pool of four workers.         |
+| `pytest_sympy`   | SymPy's polynomial tests: CPU-bound Python with deep stacks.           |
+| `pytest_polars`  | polars' unit tests, with `--native all`.                               |
+| `pytest_sklearn` | scikit-learn's tests: workers start joblib processes and BLAS threads. |
+| `pytest_pandas`  | pandas' tests: memory use grows to over a GiB.                         |
+| `pip_install`    | A virtual environment and `pip install`: spawns many short programs.   |
+
+Each scenario checks, for the whole process tree, that:
+
+- the project ran: its exit code is one that means it ran, as failing tests are not the profiler's
+  problem but a crash is (`exit_code`),
+- the CPU time of all processes adds up to what the kernel counted (`tree_cpu`),
+- the highest RSS of any process matches the peak the kernel kept for the biggest one
+  (`tree_peak_memory`),
+- the workers were discovered (`processes`) and busy workers are mostly in the function that does
+  the project's work (`tree_stack`),
+- the Firefox export has the CPU time of the threads that were in a stack (`firefox_cpu_total`).
+  CPU time of threads py-spy never saw is missing from it. That includes native threads that never
+  run Python code, like BLAS and OpenMP, which `--native all` captures. For scikit-learn that is
+  about half of the CPU time, so it shows up as a `limitation`.
+
 ## Adding a scenario
 
 Add a script to `scenarios/` using `Truth`, `truth.phase(name, checks=[...])` and `truth.save()`. See the `check_*` functions in `suite.py` for available checks and their ground-truth fields. Add any extra profiler arguments to `PROFILER_ARGS` there.
