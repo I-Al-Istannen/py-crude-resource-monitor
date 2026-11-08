@@ -1,14 +1,15 @@
+mod writer;
+
+use self::writer::{WriteRequest, write_samples};
 use crate::memory_sampler::MemorySampler;
 use crate::resources::SystemMeasurements;
-use crate::samples::{SampleFile, StackTable, write_line};
 use crate::stacktraces::{SpyHelper, StackBackend, StackSampler};
 use crate::tachyon::{TachyonError, TachyonHelper};
-use crate::types::{JsonLine, MemorySample, ProcessMetadata, ProcessResources, StackTrace};
-use log::{info, trace};
+use crate::types::{MemorySample, ProcessMetadata, ProcessResources};
+use log::info;
 use snafu::{Location, ResultExt, Snafu};
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use std::{sync, thread};
 use sync::mpsc;
@@ -53,17 +54,10 @@ pub enum TrackerError {
     },
 }
 
-#[derive(Clone, Debug)]
-struct WriteRequest {
-    /// The sample file, e.g. `42` or `global`
-    file_name: String,
-    resources: ProcessResources,
-    process: Option<ProcessMetadata>,
-    memory_samples: Vec<MemorySample>,
-    stacktraces: Vec<StackTrace>,
-    stacktrace_error: Option<String>,
-    exited: bool,
-    time: u128,
+pub struct RecordingOptions {
+    pub record_pss: bool,
+    pub memory_interval: Option<Duration>,
+    pub compress: bool,
 }
 
 pub struct Tracker {
@@ -83,18 +77,18 @@ impl Tracker {
         pid: u32,
         output_dir: PathBuf,
         backend: &StackBackend,
-        record_pss: bool,
-        memory_interval: Option<Duration>,
-        compress: bool,
+        options: RecordingOptions,
     ) -> Result<Self, TrackerError> {
-        let mut system = SystemMeasurements::new(record_pss).context(SystemMeasurementsSnafu)?;
+        let mut system =
+            SystemMeasurements::new(options.record_pss).context(SystemMeasurementsSnafu)?;
         system.refresh();
         let processes = system.process_tree([(sysinfo::Pid::from_u32(pid), None)]);
         if processes.is_empty() {
             return ProcessNotFoundSnafu { pid }.fail();
         }
 
-        let memory_sampler = memory_interval
+        let memory_sampler = options
+            .memory_interval
             .map(MemorySampler::new)
             .transpose()
             .context(SystemMeasurementsSnafu)?;
@@ -111,7 +105,7 @@ impl Tracker {
 
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(100);
 
-        let writer_thread = thread::spawn(move || write_samples(rx, output_dir, compress));
+        let writer_thread = thread::spawn(move || write_samples(rx, output_dir, options.compress));
 
         Ok(Self {
             processes,
@@ -199,7 +193,7 @@ impl Tracker {
     }
 
     /// Writes the memory measured between the previous tick and the exit of a process, which would
-    /// be lost otherwise. See [`JsonLine::exited`].
+    /// be lost otherwise. See [`crate::types::JsonLine::exited`].
     fn write_exit_memory_samples(
         &mut self,
         exited_processes: HashMap<sysinfo::Pid, ProcessMetadata>,
@@ -300,82 +294,4 @@ impl Tracker {
             Err(panic) => std::panic::resume_unwind(panic),
         }
     }
-}
-
-/// Upper bound for cached file handles, so runs with many short-lived processes do not exhaust the
-/// file descriptor limit
-const MAX_OPEN_FILES: usize = 64;
-
-fn write_samples(
-    rx: mpsc::Receiver<WriteRequest>,
-    output_dir: PathBuf,
-    compress: bool,
-) -> Result<(), TrackerError> {
-    let mut open_files: HashMap<String, SampleFile> = HashMap::new();
-    let mut line_indices: HashMap<String, usize> = HashMap::new();
-    // Kept when closing files, the frames and stacks in them stay valid
-    let mut stack_tables: HashMap<String, StackTable> = HashMap::new();
-
-    let result = (|| {
-        while let Ok(req) = rx.recv() {
-            let name = req.file_name;
-            let path = output_dir.join(&name);
-            trace!("Writing stacktraces to {path:?}");
-
-            if !open_files.contains_key(&name) && open_files.len() >= MAX_OPEN_FILES {
-                // Files of processes that are still alive will be reopened on their next sample
-                close_all(&mut open_files, &output_dir)?;
-            }
-            let file = match open_files.entry(name.clone()) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => entry.insert(
-                    SampleFile::open(&output_dir, &name, compress)
-                        .context(WriteSamplesSnafu { path: path.clone() })?,
-                ),
-            };
-            let line_index = line_indices.entry(name.clone()).or_insert(0);
-            let stack_table = stack_tables.entry(name).or_default();
-
-            let stacktraces = req
-                .stacktraces
-                .into_iter()
-                .map(|trace| stack_table.store(trace, &mut *file))
-                .collect::<Result<_, _>>()
-                .context(SerializeSampleSnafu)?;
-            let line = JsonLine {
-                stacktraces,
-                stacktrace_error: req.stacktrace_error,
-                resources: req.resources,
-                process: req.process,
-                memory_samples: req.memory_samples,
-                exited: req.exited,
-                index: *line_index,
-                time: req.time,
-            };
-            // The frames and stacks of the sample are flushed with it, so the file stays readable
-            write_line(&mut *file, &line).context(SerializeSampleSnafu)?;
-            file.flush_lines().context(WriteSamplesSnafu { path })?;
-
-            *line_index += 1;
-        }
-        Ok(())
-    })();
-
-    // Also close the files if writing failed, so the samples written so far can be read
-    let closed = close_all(&mut open_files, &output_dir);
-    result.and(closed)
-}
-
-fn close_all(
-    open_files: &mut HashMap<String, SampleFile>,
-    output_dir: &Path,
-) -> Result<(), TrackerError> {
-    let mut result = Ok(());
-    for (name, file) in open_files.drain() {
-        let closed = file.close().context(WriteSamplesSnafu {
-            path: output_dir.join(name),
-        });
-        result = result.and(closed);
-    }
-    result
 }
