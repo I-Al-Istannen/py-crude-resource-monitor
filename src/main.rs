@@ -374,6 +374,7 @@ fn run_profile(
             memory_interval,
             compress: !uncompressed,
         },
+        quit_requested.clone(),
     )
     .context(TrackerSnafu)?;
     info!("Tracking started");

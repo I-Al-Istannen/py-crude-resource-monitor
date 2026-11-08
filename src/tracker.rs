@@ -10,6 +10,8 @@ use log::info;
 use snafu::{Location, ResultExt, Snafu};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime};
 use std::{sync, thread};
 use sync::mpsc;
@@ -78,6 +80,7 @@ impl Tracker {
         output_dir: PathBuf,
         backend: &StackBackend,
         options: RecordingOptions,
+        quit_requested: Arc<AtomicBool>,
     ) -> Result<Self, TrackerError> {
         let mut system =
             SystemMeasurements::new(options.record_pss).context(SystemMeasurementsSnafu)?;
@@ -98,9 +101,9 @@ impl Tracker {
                 native_capture,
                 nonblocking,
             } => StackSampler::PySpy(SpyHelper::new(*native_capture, *nonblocking)),
-            StackBackend::Tachyon { python, pause } => {
-                StackSampler::Tachyon(TachyonHelper::new(python, *pause).context(TachyonSnafu)?)
-            }
+            StackBackend::Tachyon { python, pause } => StackSampler::Tachyon(
+                TachyonHelper::new(python, *pause, quit_requested).context(TachyonSnafu)?,
+            ),
         };
 
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(100);
