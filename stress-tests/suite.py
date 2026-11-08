@@ -43,6 +43,8 @@ PROFILER_ARGS = {
 }
 # The pid of the Firefox track with the total PSS, which is not a real process
 PSS_TOTAL_PID = 2**32 - 1
+# A scenario that takes longer than this, e.g. because a worker hangs, is stopped
+SCENARIO_TIMEOUT_SECONDS = 300
 
 
 @dataclass
@@ -577,10 +579,26 @@ def run_scenario(name: str, directory: Path, args, cpus: int) -> tuple[str, list
         # For `_truth`, when running the scenarios in findings/
         "PYTHONPATH": str(SCENARIOS),
     }
-    run = subprocess.run(command, cwd=directory, env=environment, capture_output=True, text=True)
-    (output / "profiler.log").write_text(run.stdout + run.stderr)
-    if run.returncode != 0 or not truth_file.exists():
-        failure = Result("-", "run", FAIL, "exit code 0", f"exit code {run.returncode}")
+    process = subprocess.Popen(
+        command,
+        cwd=directory,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        log, _ = process.communicate(timeout=SCENARIO_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        # The profiler stops the scenario and writes its samples on SIGTERM
+        process.terminate()
+        log, _ = process.communicate()
+        (output / "profiler.log").write_text(log)
+        failure = Result("-", "run", FAIL, f"done in {SCENARIO_TIMEOUT_SECONDS} s", "timed out")
+        return "", [failure]
+    (output / "profiler.log").write_text(log)
+    if process.returncode != 0 or not truth_file.exists():
+        failure = Result("-", "run", FAIL, "exit code 0", f"exit code {process.returncode}")
         return "", [failure]
 
     subprocess.run(
@@ -593,16 +611,25 @@ def run_scenario(name: str, directory: Path, args, cpus: int) -> tuple[str, list
     results = []
     for phase in truth["phases"]:
         for check in phase["checks"]:
-            status, expected, measured = CHECKS[check["type"]](profile, truth, phase, check)
-            results.append(Result(phase["name"], check["type"], status, expected, measured))
+            results.append(run_check(profile, truth, phase, check))
         if "finding" in phase:
             results.append(
                 Result(phase["name"], "finding", EXPECTED, phase["finding"], "no detector yet")
             )
     for check in truth["checks"]:
-        status, expected, measured = CHECKS[check["type"]](profile, truth, None, check)
-        results.append(Result("whole run", check["type"], status, expected, measured))
+        results.append(run_check(profile, truth, None, check))
     return truth["description"], results
+
+
+def run_check(profile, truth, phase, check) -> Result:
+    """Runs a check. A check that crashes, e.g. because the profile has no samples in a phase,
+    fails instead of losing the results of all scenarios."""
+    phase_name = phase["name"] if phase else "whole run"
+    try:
+        status, expected, measured = CHECKS[check["type"]](profile, truth, phase, check)
+    except Exception as e:
+        status, expected, measured = FAIL, "-", f"crashed: {type(e).__name__}: {e}"
+    return Result(phase_name, check["type"], status, expected, measured)
 
 
 def format_table(results: list[Result]) -> str:
