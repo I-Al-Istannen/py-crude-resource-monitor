@@ -17,6 +17,7 @@ run_project(
     cwd="/work/polars/py-polars",
     ok_exit_codes=(0, 1),
     min_processes=5,
-    # Thousands of tiny tests, so a lot of the time goes to collection and communication
-    stack=("pytest_runtest_protocol", 0.2),
+    # Thousands of tiny tests, so a lot of the time goes to collection and to the scheduling of
+    # xdist, which is slow with this many tests. On CI that is most of the run.
+    stack=("pytest_runtest_protocol", 0.1),
 )
