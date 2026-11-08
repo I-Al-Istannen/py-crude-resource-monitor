@@ -8,7 +8,7 @@ The suite compares profiler results with CPU and memory measurements taken by ea
 ./stress-tests/run.sh --interval 100          # sampling interval in ms
 ```
 
-Results go to `stress-tests/results/`: a summary, raw profiles, ground truth, HTML reports and Firefox Profiler exports. CI runs the default suite on pushes and pull requests; failures upload the results as an artifact.
+Results go to `stress-tests/results/`: a summary, raw profiles, ground truth, HTML reports and Firefox Profiler exports. CI runs the default suite and the real projects (below) as two parallel jobs on pushes and pull requests; failures upload the results as an artifact.
 
 | Result | Meaning |
 | --- | --- |
@@ -85,7 +85,7 @@ Results are written to `results/findings/`.
 ./stress-tests/run.sh --realworld pytest_sympy
 ```
 
-This builds `Dockerfile.realworld`, needs a few GiB and takes a few minutes. It is excluded from the default suite and CI. Results are written to `results/realworld/`.
+This builds `Dockerfile.realworld`, needs a few GiB and takes a few minutes. It is excluded from the default suite, and runs as its own CI job. Results are written to `results/realworld/`.
 
 | Scenario         | Project                                                                |
 |------------------|------------------------------------------------------------------------|

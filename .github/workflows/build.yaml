@@ -45,25 +45,69 @@ jobs:
       - name: Test
         run: cargo test --features unwind
 
-  stress-tests:
-    name: Stress Tests
+  stress-test-image:
+    name: Build Stress Test Image
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
-      - name: Run stress tests
-        run: ./stress-tests/run.sh
+      - name: Build image
+        run: docker build -f stress-tests/Dockerfile -t py-crude-resource-monitor-stress .
+
+      - name: Save image
+        run: docker save py-crude-resource-monitor-stress | gzip > stress-test-image.tar.gz
+
+      - name: Upload image
+        uses: actions/upload-artifact@v7
+        with:
+          name: stress-test-image
+          path: stress-test-image.tar.gz
+          # The image is already compressed
+          compression-level: 0
+          retention-days: 1
+
+  stress-tests:
+    name: ${{ matrix.name }}
+    needs: stress-test-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Stress Tests
+            id: stress-tests
+            args: ""
+            summary: stress-tests/results/summary.md
+          - name: Real Projects
+            id: real-projects
+            args: "--realworld"
+            summary: stress-tests/results/realworld/summary.md
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download image
+        uses: actions/download-artifact@v8
+        with:
+          name: stress-test-image
+
+      - name: Load image
+        run: gunzip -c stress-test-image.tar.gz | docker load
+
+      - name: Run ${{ matrix.name }}
+        env:
+          SKIP_IMAGE_BUILD: "yes"
+        run: ./stress-tests/run.sh ${{ matrix.args }}
 
       - name: Add summary
         if: always()
-        run: cat stress-tests/results/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+        run: cat ${{ matrix.summary }} >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Upload results
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: stress-test-results
+          name: ${{ matrix.id }}-results
           path: stress-tests/results/
 
   build:
