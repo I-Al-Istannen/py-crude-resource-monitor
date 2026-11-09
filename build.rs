@@ -5,10 +5,8 @@ fn main() {
     if std::env::var("SKIP_FRONTEND_BUILD").is_ok() {
         return;
     }
-    let pnpm_executable = if cfg!(windows) { "pnpm.cmd" } else { "pnpm" };
-
-    run_pnpm(pnpm_executable, &["install", "--frozen-lockfile"]);
-    run_pnpm(pnpm_executable, &["build"]);
+    run_pnpm(&["install", "--frozen-lockfile"]);
+    run_pnpm(&["build"]);
 
     println!("cargo::rerun-if-changed=frontend/src");
     println!("cargo::rerun-if-changed=frontend/package.json");
@@ -19,8 +17,17 @@ fn main() {
     println!("cargo::rerun-if-changed=build.rs");
 }
 
-fn run_pnpm(pnpm_executable: &str, args: &[&str]) {
-    let status = Command::new(pnpm_executable)
+fn run_pnpm(args: &[&str]) {
+    // On Windows, pnpm is a batch script (pnpm.cmd from npm, pnpm.bat from conda-forge),
+    // which only cmd resolves via PATHEXT
+    let mut command = if cfg!(windows) {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "pnpm"]);
+        command
+    } else {
+        Command::new("pnpm")
+    };
+    let status = command
         .args(args)
         .current_dir("frontend")
         .status()

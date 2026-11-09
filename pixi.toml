@@ -1,0 +1,59 @@
+[workspace]
+name = "py-crude-resource-monitor"
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64", "osx-64", "win-64"]
+preview = ["pixi-build"]
+exclude-newer = "7d"
+
+# sysinfo uses kIOMainPortDefault which requires macOS 12
+[workspace.target.osx-64.build-variants]
+c_stdlib_version = ["12.0"]
+
+[workspace.target.osx-arm64.build-variants]
+c_stdlib_version = ["12.0"]
+
+[package]
+name = "py-crude-resource-monitor"
+version = "0.4.0"
+
+[package.build.backend]
+name = "pixi-build-rust"
+version = "*"
+
+[package.build.config]
+env = { CARGO_PROFILE_RELEASE_STRIP = "symbols", CARGO_PROFILE_RELEASE_LTO = "fat" }
+# build.rs builds the web client with pnpm and embeds it into the binary
+extra-input-globs = [
+  "frontend/src/**/*",
+  "frontend/index.html",
+  "frontend/package.json",
+  "frontend/pnpm-lock.yaml",
+  "frontend/tsconfig.json",
+  "frontend/vite.config.ts",
+]
+
+[package.build.target.linux.config]
+env = { RUSTFLAGS = "-C link-arg=-Wl,-rpath-link,$PREFIX/lib -L$PREFIX/lib" }
+
+# py-spy's native unwinding only supports x86_64 Linux
+# https://github.com/benfred/py-spy/issues/729, https://github.com/benfred/py-spy/pull/330
+[package.build.target.linux-64.config]
+extra-args = ["--features", "unwind"]
+
+[package.build-dependencies]
+nodejs = "*"
+pnpm = "*"
+
+[package.host-dependencies]
+libunwind = { version = "*", when = "linux" }
+liblzma-devel = { version = "*", when = "linux" }
+
+[dependencies]
+rust = "*"
+nodejs = "*"
+pnpm = "*"
+
+[target.linux.dependencies]
+c-compiler = "*"
+libunwind = "*"
+liblzma-devel = "*"
